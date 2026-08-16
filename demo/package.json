@@ -1,0 +1,19 @@
+{
+  "name": "incentive-engine-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Demo scenarios for @usethink/incentive-engine — 多行业集成演示 + 集成冒烟测试",
+  "scripts": {
+    "demo:ecommerce": "node scenarios/01-ecommerce.js",
+    "demo:content": "node scenarios/02-content-platform.js",
+    "demo:gaming": "node scenarios/03-gaming.js",
+    "demo:settle": "node scenarios/04-full-settle.js",
+    "demo:all": "node scenarios/01-ecommerce.js && node scenarios/02-content-platform.js && node scenarios/03-gaming.js && node scenarios/04-full-settle.js",
+    "check": "node --check scenarios/01-ecommerce.js && node --check scenarios/02-content-platform.js && node --check scenarios/03-gaming.js && node --check scenarios/04-full-settle.js && node --check mocks/memory-model.js && node --check mocks/memory-sequelize.js && node --check mocks/memory-rule-set-service.js && node --check utils/print.js && node --check shared/ecommerce-rules.js",
+    "verify": "npm run check && npm run demo:all"
+  },
+  "dependencies": {
+    "@usethink/incentive-engine": "file:.."
+  }
+}
+

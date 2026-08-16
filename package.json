@@ -1,0 +1,46 @@
+{
+  "name": "@usethink/incentive-engine",
+  "version": "3.0.0",
+  "description": "通用营销激励引擎 — 领域无关的纯计算核心，支持 DIRECT/LEVEL 奖励分配、封顶裁剪、预算兜底、等级评估、条件评估、流水线编排、配置校验、灰度版本路由",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "test:watch": "node --experimental-vm-modules node_modules/.bin/jest --watch"
+  },
+  "keywords": [
+    "marketing",
+    "incentive",
+    "engine",
+    "commission",
+    "reward",
+    "distribution"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "decimal.js": "^10.4.3"
+  },
+  "peerDependencies": {
+    "joi": "^17.0.0",
+    "sequelize": "^6.0.0"
+  },
+  "peerDependenciesMeta": {
+    "joi": {
+      "optional": true
+    },
+    "sequelize": {
+      "optional": true
+    }
+  },
+  "files": [
+    "src/",
+    "docs/",
+    "README.md"
+  ],
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "joi": "^17.13.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
