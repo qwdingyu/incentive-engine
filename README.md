@@ -210,6 +210,7 @@ const result = await customerService.settle(businessEvent);
 - 无落账记录时返回 `{ success: true, data: { skipped: true, lines: [] } }`
 - `settleWithTransaction` 在传入事务内做幂等预读，命中返回 `{ idempotent: true }`
 - `batchSettle([])` 空数组视为合法空批次，返回 `{ success: true, data: { results: [] } }`
+- **`ruleSetCode` 双传参契约**：三个入口 `settle(event, options)` / `settleWithTransaction(event, tx, options)` / `batchSettle(events, options)` 统一由 `options.ruleSetCode` 决定引擎**计算**选用的规则集；事件对象内的 `ruleSetCode` 字段不参与引擎选规则集（仅你的 `buildRecord` 用它落库 `rule_set_code` 审计列）。二者都缺省时退化为构造时 `config.ruleSetCode` 默认值。若 `_calculate` 打出 `未传 options.ruleSetCode` 的 warn，即提示漏传了覆盖——**需要覆盖规则集时务必显式传 `options.ruleSetCode`**，并把事件内 `ruleSetCode` 也带上用于落库。
 
 ---
 

@@ -310,6 +310,18 @@ class GenericSettlementService {
   async _calculate(businessEvent, options = {}) {
     const ruleSetCode = options.ruleSetCode || this.ruleSetCode;
 
+    // 预防性告警（防止"把 ruleSetCode 放事件内却漏传 options"静默用错默认规则集）：
+    // - options.ruleSetCode 缺省时本次用配置默认规则集；
+    // - 若事件内也带 ruleSetCode，几乎可断定调用方意图覆盖但传错了地方，务必明示。
+    if (!options.ruleSetCode) {
+      this.log.warn(
+        `[GenericSettlement:${this.name}] 未传 options.ruleSetCode，本次计算使用默认规则集 "${this.ruleSetCode}"` +
+          (businessEvent && businessEvent.ruleSetCode
+            ? `；注意：事件内 ruleSetCode="${businessEvent.ruleSetCode}" 仅用于 buildRecord 落库 rule_set_code 字段，不参与引擎选择规则集`
+            : "")
+      );
+    }
+
     // 1. 加载规则集
     const loaded = await this.ruleSetService.getActiveRuleSet(ruleSetCode, {
       routingKey: options.routingKey,
