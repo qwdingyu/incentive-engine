@@ -159,12 +159,128 @@ describe("Distribute", () => {
     }).toThrow("必须包含 type 字段");
   });
 
-  test("distributeByDefs — CUSTOM 类型静默跳过不抛错", () => {
+  test("distributeByDefs — CUSTOM 无金额来源静默跳过不抛错", () => {
+    // CUSTOM 已实现（v3.3.0）：amount/amountFrom 均未配置 → 金额解析失败静默跳过，
+    // 保持"配置中存在但未配金额的 CUSTOM 规则"不抛错兼容（规则集校验层会提前拦截）。
     const records = Engine.Distribute.distributeByDefs({
       event: { sourceNodeId: "u1", eventValue: "1000" },
-      rewardDefs: [{ rewardId: "custom", type: "CUSTOM" }],
+      rewardDefs: [{ rewardId: "custom", type: "CUSTOM", target: "SOURCE" }],
     });
     expect(records).toEqual([]);
+  });
+
+  test("distributeByDefs — CUSTOM 未知 target 抛错", () => {
+    expect(() => Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "100" },
+      rewardDefs: [{ rewardId: "custom", type: "CUSTOM", target: "BOGUS", amount: "8" }],
+    })).toThrow(/CUSTOM 奖励定义未知 target/);
+  });
+
+  test("distributeByDefs — CUSTOM SOURCE 固定金额常量", () => {
+    // "注册送 100 积分"：事件来源节点自身拿固定金额，与事件值无关。
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "0" },
+      rewardDefs: [{ rewardId: "signup_bonus", type: "CUSTOM", target: "SOURCE", amount: "100" }],
+    });
+    expect(records.length).toBe(1);
+    expect(records[0].nodeId).toBe("u1");
+    expect(records[0].rewardType).toBe("CUSTOM");
+    expect(Decimal.eq(records[0].amount, "100")).toBe(true);
+    expect(records[0].snapshot.amountFrom).toBeNull();
+  });
+
+  test("distributeByDefs — CUSTOM SOURCE 动态取数 eventValue", () => {
+    // 金额 = 事件值本身（如"按实付金额发放"）。
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "88" },
+      rewardDefs: [{ rewardId: "cashback", type: "CUSTOM", target: "SOURCE", amountFrom: "eventValue" }],
+    });
+    expect(records.length).toBe(1);
+    expect(Decimal.eq(records[0].amount, "88")).toBe(true);
+  });
+
+  test("distributeByDefs — CUSTOM SOURCE 动态取数 event.attrs 路径", () => {
+    // 从事件扩展属性按点分路径取数（如"V1 等级拿 10 元"由上层把等级金额写入 attrs）。
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "0", attrs: { level: { bonus: "10" } } },
+      rewardDefs: [{ rewardId: "level_bonus", type: "CUSTOM", target: "SOURCE", amountFrom: "event.attrs.level.bonus" }],
+    });
+    expect(records.length).toBe(1);
+    expect(Decimal.eq(records[0].amount, "10")).toBe(true);
+  });
+
+  test("distributeByDefs — CUSTOM 取数失败回退 amount 常量", () => {
+    // attrs 中无该路径 → 回退固定金额 5。
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "0", attrs: { level: "V1" } },
+      rewardDefs: [{
+        rewardId: "level_bonus", type: "CUSTOM", target: "SOURCE",
+        amount: "5", amountFrom: "event.attrs.level.bonus",
+      }],
+    });
+    expect(records.length).toBe(1);
+    expect(Decimal.eq(records[0].amount, "5")).toBe(true);
+  });
+
+  test("distributeByDefs — CUSTOM SOURCE 金额<=0 不发", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "0" },
+      rewardDefs: [{ rewardId: "zero", type: "CUSTOM", target: "SOURCE", amount: "0" }],
+    });
+    expect(records.length).toBe(0);
+  });
+
+  test("distributeByDefs — CUSTOM PARENT 固定金额（与事件值无关）", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "1" },
+      directParent: { id: "u0", rankRate: "10" },
+      rewardDefs: [{ rewardId: "inviter_bonus", type: "CUSTOM", target: "PARENT", amount: "50" }],
+    });
+    expect(records.length).toBe(1);
+    expect(records[0].nodeId).toBe("u0");
+    expect(Decimal.eq(records[0].amount, "50")).toBe(true);
+  });
+
+  test("distributeByDefs — CUSTOM PARENT skipRankZero 默认跳过最低等级", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "100" },
+      directParent: { id: "u0", rankRate: "0" },
+      rewardDefs: [{ rewardId: "inviter_bonus", type: "CUSTOM", target: "PARENT", amount: "50" }],
+    });
+    expect(records.length).toBe(0);
+  });
+
+  test("distributeByDefs — CUSTOM PARENT skipRankZero=false 最低等级也发", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "100" },
+      directParent: { id: "u0", rankRate: "0" },
+      rewardDefs: [{
+        rewardId: "inviter_bonus", type: "CUSTOM", target: "PARENT",
+        amount: "50", skipRankZero: false,
+      }],
+    });
+    expect(records.length).toBe(1);
+    expect(Decimal.eq(records[0].amount, "50")).toBe(true);
+  });
+
+  test("calculateCustom — 动态取数 eventValue 覆盖固定金额", () => {
+    const r = Engine.Distribute.calculateCustom({
+      rewardDef: { rewardId: "c", type: "CUSTOM", amount: "1", amountFrom: "eventValue" },
+      event: { eventValue: "999" },
+      targetNode: { id: "u0", rankRate: "10" },
+    });
+    expect(r).not.toBeNull();
+    expect(Decimal.eq(r.amount, "999")).toBe(true);
+    expect(r.rewardType).toBe("CUSTOM");
+  });
+
+  test("calculateCustom — 无目标节点返回 null", () => {
+    const r = Engine.Distribute.calculateCustom({
+      rewardDef: { rewardId: "c", type: "CUSTOM", amount: "10" },
+      event: { eventValue: "100" },
+      targetNode: null,
+    });
+    expect(r).toBeNull();
   });
 
   test("calculateLevelChain — attrs.rankRate 回退", () => {
@@ -818,6 +934,48 @@ describe("Validation", () => {
     });
     expect(error).toBeDefined();
     expect(error.details[0].context.message).toMatch(/fixedAmount/);
+  });
+
+  test("ruleSetConfigSchema - CUSTOM 类型带 amount 通过", () => {
+    const { error } = ruleSetConfigSchema.validate({
+      rewardDefs: [{ rewardId: "r1", type: "CUSTOM", target: "SOURCE", amount: "100" }],
+      rankDefs: [{ rankId: "MEMBER", levelIndex: 0, conditions: [] }],
+    });
+    expect(error).toBeUndefined();
+  });
+
+  test("ruleSetConfigSchema - CUSTOM 类型带 amountFrom(eventValue) 通过", () => {
+    const { error } = ruleSetConfigSchema.validate({
+      rewardDefs: [{ rewardId: "r1", type: "CUSTOM", target: "PARENT", amountFrom: "eventValue" }],
+      rankDefs: [{ rankId: "MEMBER", levelIndex: 0, conditions: [] }],
+    });
+    expect(error).toBeUndefined();
+  });
+
+  test("ruleSetConfigSchema - CUSTOM 类型带 amountFrom(event.attrs 路径) 通过", () => {
+    const { error } = ruleSetConfigSchema.validate({
+      rewardDefs: [{ rewardId: "r1", type: "CUSTOM", target: "SOURCE", amountFrom: "event.attrs.level.bonus" }],
+      rankDefs: [{ rankId: "MEMBER", levelIndex: 0, conditions: [] }],
+    });
+    expect(error).toBeUndefined();
+  });
+
+  test("ruleSetConfigSchema - CUSTOM 类型缺金额（无 amount/amountFrom）失败", () => {
+    const { error } = ruleSetConfigSchema.validate({
+      rewardDefs: [{ rewardId: "r1", type: "CUSTOM", target: "SOURCE", rate: "5" }],
+      rankDefs: [{ rankId: "MEMBER", levelIndex: 0, conditions: [] }],
+    });
+    expect(error).toBeDefined();
+    expect(error.details[0].context.message).toMatch(/CUSTOM/);
+  });
+
+  test("ruleSetConfigSchema - CUSTOM amountFrom 非法路径失败", () => {
+    const { error } = ruleSetConfigSchema.validate({
+      rewardDefs: [{ rewardId: "r1", type: "CUSTOM", target: "SOURCE", amountFrom: "node.attrs.x" }],
+      rankDefs: [{ rankId: "MEMBER", levelIndex: 0, conditions: [] }],
+    });
+    expect(error).toBeDefined();
+    expect(error.details[0].context.message).toMatch(/amountFrom/);
   });
 
   test("ruleSetConfigSchema - rankDef 携带 rankRate 通过", () => {

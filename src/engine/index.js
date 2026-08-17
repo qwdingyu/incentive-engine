@@ -7,6 +7,8 @@
  * rewardDefs/rankDefs/capDefs 配置后交给引擎。
  * 所有 DB 访问和事务边界由 Service 层负责，引擎只做"输入 → 计算 → 输出"。
  *
+ * v2.3.0：新增 CUSTOM 固定金额奖励原语（amount 常量 + amountFrom 动态取数）。
+ *
  * @version 2.3.0
  */
 

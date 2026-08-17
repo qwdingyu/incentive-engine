@@ -11,20 +11,24 @@
  * - FIXED：按固定金额 fixedAmount 发放（与事件金额无关，target 语义同 DIRECT）
  * - LEVEL：链式差额分配，沿祖先链按每个节点的 rankRate（顶层 rankRate 优先，
  *   回退到 node.attrs?.rankRate）做水位差，accumulateInChain=true 的奖励才累加水位
- * - CUSTOM：自定义，由上层注册处理器（一期预留，不实现）
+ * - CUSTOM：固定金额 + 可选动态取数。amount 为固定金额常量；amountFrom 提供
+ *   时从事件动态取数（"eventValue" 取事件值本身；"event.attrs.<path>" 按点分
+ *   路径取事件扩展属性），取数失败回退 amount。target 语义同 DIRECT/FIXED。
  *
  * 对应《03_通用营销激励引擎架构设计.md》§4.3 RewardDef 的最小实现。
  *
- * @version 1.1.0
+ * @version 1.2.0
  */
 class RewardDef {
   /**
    * @param {Object} params
    * @param {string} params.rewardId - 奖励标识（写入选民记录的 rewardType 字段）
-   * @param {string} params.type - DIRECT | LEVEL | CUSTOM
+   * @param {string} params.type - DIRECT | LEVEL | FIXED | CUSTOM
    * @param {string|number|null} params.rate - 比例（百分比整数，10=10%）；LEVEL 通常为 null（用链上 rankRate）
    * @param {string|number|null} [params.fixedAmount] - 固定金额（decimal string，FIXED 类型必填）
-   * @param {string} [params.target] - DIRECT 的目标：SOURCE | PARENT
+   * @param {string|number|null} [params.amount] - CUSTOM 固定金额常量（decimal string）
+   * @param {string|null} [params.amountFrom] - CUSTOM 动态取数路径："eventValue" | "event.attrs.<path>"（可选）
+   * @param {string} [params.target] - DIRECT/FIXED/CUSTOM 的目标：SOURCE | PARENT
    * @param {boolean} [params.skipRankZero] - 是否跳过最低等级节点（LEVEL 穿透；默认 true）
    * @param {boolean} [params.accumulateInChain] - LEVEL 是否累加到链式水位（默认 false）
    * @param {string} [params.allocatorId] - 使用的分配器 ID
@@ -36,6 +40,8 @@ class RewardDef {
     type = "DIRECT",
     rate = null,
     fixedAmount = null,
+    amount = null,
+    amountFrom = null,
     target = "PARENT",
     skipRankZero = true,
     accumulateInChain = false,
@@ -47,6 +53,8 @@ class RewardDef {
     this.type = type;
     this.rate = rate === null || rate === undefined ? null : String(rate);
     this.fixedAmount = fixedAmount === null || fixedAmount === undefined ? null : String(fixedAmount);
+    this.amount = amount === null || amount === undefined ? null : String(amount);
+    this.amountFrom = amountFrom === null || amountFrom === undefined ? null : String(amountFrom);
     this.target = target;
     this.skipRankZero = skipRankZero;
     this.accumulateInChain = accumulateInChain;

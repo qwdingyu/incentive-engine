@@ -11,7 +11,7 @@
  *   const { ruleSetConfigSchema } = schemas;
  * 这样可以避免 joi 跨包版本不一致导致的 "Cannot mix different versions" 错误。
  *
- * @version 3.2.0
+ * @version 3.3.0
  */
 
 /**
@@ -55,13 +55,15 @@ function createRuleSetValidation(Joi) {
     type: Joi.string().valid("DIRECT", "LEVEL", "FIXED", "CUSTOM").required(),
     rate: pctRateSchema,
     fixedAmount: nonNegativeSchema,
+    amount: nonNegativeSchema,
+    amountFrom: Joi.string().max(128).optional(),
     target: Joi.string().valid("SOURCE", "PARENT").optional(),
     skipRankZero: Joi.boolean().optional(),
     accumulateInChain: Joi.boolean().optional(),
     allocatorId: Joi.string().max(64).allow(null).optional(),
     conditions: Joi.array().items(Joi.object()).optional(),
     metadata: Joi.object().optional(),
-  }).custom(validateRewardFixedAmount, "FIXED 固定金额交叉校验");
+  }).custom(validateRewardAmount, "FIXED/CUSTOM 金额交叉校验");
 
   const conditionSchema = Joi.object({
     field: Joi.string().max(64).required(),
@@ -121,17 +123,33 @@ function createRuleSetValidation(Joi) {
   // ==================== 唯一性/交叉校验器 ====================
 
   /**
-   * FIXED 类型交叉校验：type="FIXED" 时必须提供大于 0 的 fixedAmount。
-   * 防止配置作者误把 FIXED 当 DIRECT 用（只写 rate 不写 fixedAmount），
-   * 或 fixedAmount 配成 0，导致引擎静默不发奖/不可预期的行为。
+   * FIXED / CUSTOM 类型交叉校验：
+   * - FIXED：必须提供大于 0 的 fixedAmount（防止只写 rate 不写 fixedAmount，导致引擎静默不发奖）。
+   * - CUSTOM：必须提供大于 0 的 amount 或有效的 amountFrom（动态取数路径）至少其一；
+   *   amountFrom 仅支持 "eventValue" 与 "event.attrs.<path>"。防止配置了 CUSTOM 却
+   *   没有金额来源，导致引擎静默跳过（配置错误而非规则设计如此）。
    */
-  function validateRewardFixedAmount(value, helpers) {
+  function validateRewardAmount(value, helpers) {
     if (value.type === "FIXED") {
       const fa = value.fixedAmount;
       const ok = fa !== undefined && fa !== null && fa !== "" && Number(fa) > 0;
       if (!ok) {
         return helpers.error("any.custom", {
           message: `FIXED 奖励类型必须提供大于 0 的 fixedAmount（rewardId=${value.rewardId}）`,
+        });
+      }
+    }
+    if (value.type === "CUSTOM") {
+      const hasAmount = value.amount !== undefined && value.amount !== null && value.amount !== "" && Number(value.amount) > 0;
+      const hasAmountFrom = typeof value.amountFrom === "string" && value.amountFrom.length > 0;
+      if (!hasAmount && !hasAmountFrom) {
+        return helpers.error("any.custom", {
+          message: `CUSTOM 奖励类型必须提供大于 0 的 amount 或有效的 amountFrom（rewardId=${value.rewardId}）`,
+        });
+      }
+      if (value.amountFrom && value.amountFrom !== "eventValue" && !value.amountFrom.startsWith("event.attrs.")) {
+        return helpers.error("any.custom", {
+          message: `CUSTOM amountFrom 仅支持 "eventValue" 或 "event.attrs.<path>"（rewardId=${value.rewardId}）`,
         });
       }
     }

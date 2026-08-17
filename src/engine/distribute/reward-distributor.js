@@ -6,27 +6,29 @@
  * - DIRECT + target=SOURCE  → 事件来源节点自身（如"本人收益 100%"）
  * - DIRECT + target=PARENT  → 直接上级（如"一级分销佣金 10%"）
  * - FIXED                   → 固定金额（DIRECT 的按比例版，金额与事件值无关；target 同 DIRECT）
+ * - CUSTOM                  → 固定金额常量 + 可选动态取数（amount / amountFrom；target 同 DIRECT）
  * - LEVEL                  → 链式差额（如"多级团队佣金/极差"）
  *
  * 松茸场景的候选构造见 src/adapters/songrong-reward-adapter.js。
  *
- * @version 2.2.0
+ * @version 2.3.0
  */
 
 const Decimal = require("../../decimal");
-const { calculateDirect, calculateFixed } = require("./direct-calculator");
+const { calculateDirect, calculateFixed, calculateCustom, resolveCustomAmount } = require("./direct-calculator");
 const { calculateLevelChain } = require("./chain-calculator");
 
 /**
  * 按奖励定义列表分发事件奖励（通用纯计算）
  *
  * @param {Object} params
- * @param {Object} params.event - EngineEvent { sourceNodeId, eventValue, eventType, eventId }
+ * @param {Object} params.event - EngineEvent { sourceNodeId, eventValue, eventType, eventId, attrs? }
  * @param {Object|null} params.directParent - 直接上级节点 { id, rankRate? }；DIRECT target=PARENT 用
  * @param {Array<Object>} params.ancestors - 祖先链（近到远）；LEVEL 用，每个元素 { id, rankRate }
  * @param {Array<Object>} params.rewardDefs - 奖励定义列表
  *        DIRECT: { rewardId, type:"DIRECT", target:"SOURCE"|"PARENT", rate, skipRankZero? }
  *        FIXED:  { rewardId, type:"FIXED", target:"SOURCE"|"PARENT", fixedAmount, skipRankZero? }
+ *        CUSTOM: { rewardId, type:"CUSTOM", target:"SOURCE"|"PARENT", amount?, amountFrom?, skipRankZero? }
  *        LEVEL:  { rewardId, type:"LEVEL", accumulateInChain }
  * @returns {Array<Object>} 通用候选记录
  *         { nodeId, rewardId, rewardType, amount, previousRate?, currentRate?, diffRate?, snapshot }
@@ -100,8 +102,35 @@ function distributeByDefs({ event, directParent = null, ancestors = [], rewardDe
         throw new Error(`FIXED 奖励定义未知 target: "${def.target}"（支持: SOURCE, PARENT）`);
       }
     } else if (def.type === "CUSTOM") {
-      // CUSTOM 类型预留：由上层注册处理器，一期不实现（避免过度设计）。
-      // 遇到 CUSTOM 类型时静默跳过（不抛错，允许配置中存在但未注册的 CUSTOM 规则）。
+      // CUSTOM：固定金额常量 + 可选动态取数（如"注册送 100 积分"、"V1 拿 10 元固定红包"）。
+      // 金额解析：amountFrom（"eventValue" / "event.attrs.<path>"）优先，失败回退 amount 常量；
+      // 两者都不可解析 → 静默跳过（保持"配置中存在但未配金额的 CUSTOM 规则"不抛错兼容）。
+      if (def.target === "SOURCE") {
+        // 事件来源节点自身：解析金额后发放。与 DIRECT/FIXED-SOURCE 一致，不应用 skipRankZero。
+        const resolved = resolveCustomAmount(def, event);
+        if (resolved !== null && Decimal.gt(resolved, "0")) {
+          records.push({
+            nodeId: event?.sourceNodeId ?? null,
+            rewardId: def.rewardId,
+            rewardType: "CUSTOM",
+            amount: resolved,
+            snapshot: {
+              rewardId: def.rewardId,
+              rewardType: "CUSTOM",
+              target: "SOURCE",
+              amount: resolved,
+              amountFrom: def.amountFrom ?? null,
+              sourceNodeId: event?.sourceNodeId ?? null,
+            },
+          });
+        }
+      } else if (def.target === "PARENT") {
+        // CUSTOM target=PARENT：直接上级固定金额/动态金额。
+        const r = calculateCustom({ rewardDef: def, event, targetNode: directParent });
+        if (r) records.push(r);
+      } else {
+        throw new Error(`CUSTOM 奖励定义未知 target: "${def.target}"（支持: SOURCE, PARENT）`);
+      }
     } else {
       throw new Error(`未知奖励类型: "${def.type}"（支持: DIRECT, LEVEL, FIXED, CUSTOM）`);
     }
