@@ -1,0 +1,30 @@
+# 引擎 CI：安装 → 单测 → 顶层加载冒烟 → 发版就绪校验
+# 触发：对 main/master 的 push 与任意 PR。无需外部服务（自包含）。
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: 安装依赖（锁文件驱动，可重现）
+        run: npm ci
+      - name: 单元测试
+        run: npm test
+      - name: 顶层加载冒烟（防护可选 peer 误提升）
+        run: npm run smoke
+      - name: 发版就绪校验（断言 tarball 必备文件齐全）
+        run: node scripts/verify-pack.js
