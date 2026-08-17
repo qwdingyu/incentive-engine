@@ -247,6 +247,42 @@ function createRuleSetValidation(Joi) {
 
 const { validateCustomerConfig } = require("./customer-config");
 
-module.exports = { createRuleSetValidation, validateCustomerConfig };
+/**
+ * 引擎配置字段键名常量（单一事实来源）
+ *
+ * 供消费方（rbb 等）引用，避免手写字段名与引擎漂移。
+ * 消费方 `_computeDiff` 的 rewardDefs/rankDefs/capDefs 归类键应引用此常量，
+ * 而非手写 `rewardId`/`rankId`/`capId` 字面量。
+ *
+ * @type {Object}
+ * @property {string} REWARD_ID - rewardDef 唯一标识字段名
+ * @property {string} RANK_ID - rankDef 唯一标识字段名
+ * @property {string} CAP_ID - capDef 唯一标识字段名
+ * @property {string} TYPE - 奖励类型字段名
+ * @property {string} TARGET - 奖励目标字段名
+ * @property {string} RATE - 比例字段名
+ * @property {string} FIXED_AMOUNT - 固定金额字段名
+ * @property {string} AMOUNT - CUSTOM 金额字段名
+ * @property {string} AMOUNT_FROM - CUSTOM 动态取数路径字段名
+ * @property {string} LEVEL_INDEX - 等级索引字段名
+ * @property {string} SCOPE - 封顶范围字段名
+ * @property {string} LIMIT - 封顶限额字段名
+ */
+const CONFIG_FIELD_KEYS = Object.freeze({
+  REWARD_ID: "rewardId",
+  RANK_ID: "rankId",
+  CAP_ID: "capId",
+  TYPE: "type",
+  TARGET: "target",
+  RATE: "rate",
+  FIXED_AMOUNT: "fixedAmount",
+  AMOUNT: "amount",
+  AMOUNT_FROM: "amountFrom",
+  LEVEL_INDEX: "levelIndex",
+  SCOPE: "scope",
+  LIMIT: "limit",
+});
+
+module.exports = { createRuleSetValidation, validateCustomerConfig, CONFIG_FIELD_KEYS };
 
 

@@ -42,7 +42,7 @@ const Engine = require("./engine");
 const Adapters = require("./adapters");
 const Decimal = require("./decimal");
 const Services = require("./services");
-const { createRuleSetValidation, validateCustomerConfig } = require("./validation");
+const { createRuleSetValidation, validateCustomerConfig, CONFIG_FIELD_KEYS } = require("./validation");
 const Utils = require("./utils");
 
 module.exports = {
@@ -50,6 +50,6 @@ module.exports = {
   Adapters,
   Decimal,
   Services,
-  Validation: { createRuleSetValidation, validateCustomerConfig },
+  Validation: { createRuleSetValidation, validateCustomerConfig, CONFIG_FIELD_KEYS },
   Utils,
 };
