@@ -7,6 +7,11 @@
 
 const Decimal = require("../src/decimal");
 const Engine = require("../src/engine");
+const { buildPipelineStages, customerAdapterTemplate } = require("../src/adapters");
+const Joi = require("joi");
+const { createRuleSetValidation } = require("../src/validation");
+const { ruleSetConfigSchema } = createRuleSetValidation(Joi);
+const { selectVersionByRoutingKey, validateGrayscaleWeights } = require("../src/utils");
 
 // ====================== Model ======================
 
@@ -833,7 +838,7 @@ describe("Orchestrate", () => {
 
 describe("Adapters", () => {
   test("buildPipelineStages — 默认 DISTRIBUTE + CAP", () => {
-    const stages = require("../src/adapters").buildPipelineStages(
+    const stages = buildPipelineStages(
       {
         rewardDefs: [{ rewardId: "r1", type: "DIRECT", target: "SOURCE", rate: "100" }],
         capDefs: [],
@@ -846,7 +851,7 @@ describe("Adapters", () => {
   });
 
   test("buildPipelineStages — 自定义 pipelineDef", () => {
-    const stages = require("../src/adapters").buildPipelineStages(
+    const stages = buildPipelineStages(
       {
         rewardDefs: [{ rewardId: "r1", type: "DIRECT", target: "SOURCE", rate: "100" }],
         capDefs: [],
@@ -859,19 +864,14 @@ describe("Adapters", () => {
   });
 
   test("customerAdapterTemplate 存在且有结构", () => {
-    const template = require("../src/adapters").customerAdapterTemplate;
-    expect(template).toBeDefined();
-    expect(typeof template).toBe("object");
+    expect(customerAdapterTemplate).toBeDefined();
+    expect(typeof customerAdapterTemplate).toBe("object");
   });
 });
 
 // ====================== Validation ======================
 
 describe("Validation", () => {
-  const Joi = require("joi");
-  const { createRuleSetValidation } = require("../src/validation");
-  const { ruleSetConfigSchema } = createRuleSetValidation(Joi);
-
   test("ruleSetConfigSchema - 有效配置通过", () => {
     const validConfig = {
       rewardDefs: [{ rewardId: "r1", type: "DIRECT", target: "SOURCE", rate: "100" }],
@@ -1011,7 +1011,6 @@ describe("Validation", () => {
 
 describe("Utils", () => {
   test("selectVersionByRoutingKey - 单版本直接返回", () => {
-    const { selectVersionByRoutingKey } = require("../src/utils");
     const result = selectVersionByRoutingKey(
       { enabled: true, versions: [{ version: 1, weight: 100, config_json: { test: true } }] },
       "user123"
@@ -1020,7 +1019,6 @@ describe("Utils", () => {
   });
 
   test("selectVersionByRoutingKey - 禁用的灰度返回 null", () => {
-    const { selectVersionByRoutingKey } = require("../src/utils");
     const result = selectVersionByRoutingKey(
       { enabled: false, versions: [{ version: 1, weight: 100, config_json: { test: true } }] },
       "user123"
@@ -1029,7 +1027,6 @@ describe("Utils", () => {
   });
 
   test("selectVersionByRoutingKey - 多版本按权重分配", () => {
-    const { selectVersionByRoutingKey } = require("../src/utils");
     const config = {
       enabled: true,
       versions: [
@@ -1046,7 +1043,6 @@ describe("Utils", () => {
   });
 
   test("validateGrayscaleWeights - 权重总和 100 返回 true", () => {
-    const { validateGrayscaleWeights } = require("../src/utils");
     expect(validateGrayscaleWeights({
       enabled: true,
       versions: [{ version: 1, weight: 70 }, { version: 2, weight: 30 }],
@@ -1054,7 +1050,6 @@ describe("Utils", () => {
   });
 
   test("validateGrayscaleWeights - 权重总和不为 100 返回 false", () => {
-    const { validateGrayscaleWeights } = require("../src/utils");
     expect(validateGrayscaleWeights({
       enabled: true,
       versions: [{ version: 1, weight: 60 }, { version: 2, weight: 30 }],

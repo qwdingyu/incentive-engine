@@ -47,6 +47,8 @@ jest.mock("sequelize", () => {
 // ===================== 导入被测试模块 =====================
 
 const { GenericSettlementService, REQUIRED_CONFIG_KEYS } = require("../src/services/generic-settlement.service");
+// sequelize 已被 jest.mock（返回 UCE），此处解构 mock 的 UniqueConstraintError 供测试内构造冲突异常
+const { UniqueConstraintError } = require("sequelize");
 
 // ===================== 辅助函数 =====================
 
@@ -236,7 +238,6 @@ describe("GenericSettlementService", () => {
         final: [{ rewardId: "commission", nodeId: "u0", amount: "100" }],
         context: {},
       });
-      const { UniqueConstraintError } = require("sequelize");
       cfg.model.create.mockRejectedValue(new UniqueConstraintError("重复键冲突"));
       const svc = new GenericSettlementService(cfg);
       const result = await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" });
