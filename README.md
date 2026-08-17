@@ -254,11 +254,17 @@ const result = executeCustomerIncentive({
 
 ```bash
 npm install      # 安装依赖
-npm test         # 运行测试（161 个测试覆盖全部模块）
+npm test         # 运行测试（覆盖全部模块）
 npm run test:watch  # 观察模式
+npm run smoke    # 顶层加载冒烟：模拟消费方 require 入口，防护可选 peer 误提升
 
 cd demo && npm install && npm run demo:all   # 运行 4 个行业集成 Demo
 ```
+
+### 发版防线
+
+- `prepublishOnly` 在 `npm publish` 前执行 `scripts/verify-pack.js`，用 `npm pack --dry-run --json` 断言 tarball 必备文件（LICENSE / README / src 入口）齐全，发版零阻塞。
+- `joi` / `sequelize` 为 **optional peerDependencies**：消费方缺装也能安全顶层加载（真正使用结算/校验功能时才需要）。改动引擎入口时请运行 `npm run smoke` 守护，勿把 optional peer 提升到顶层 `require`。
 
 ---
 

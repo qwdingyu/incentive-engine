@@ -6,6 +6,7 @@
   "scripts": {
     "test": "node --experimental-vm-modules node_modules/.bin/jest",
     "test:watch": "node --experimental-vm-modules node_modules/.bin/jest --watch",
+    "smoke": "node scripts/smoke-require.js",
     "prepublishOnly": "node scripts/verify-pack.js"
   },
   "keywords": [
@@ -17,6 +18,8 @@
     "distribution"
   ],
   "license": "MIT",
+  "author": "usethink contributors",
+  "homepage": "https://www.npmjs.com/package/@usethink/incentive-engine",
   "dependencies": {
     "decimal.js": "^10.4.3"
   },
