@@ -647,6 +647,70 @@ describe("Orchestrate", () => {
     expect(Decimal.eq(final.splits[0].amount, "700")).toBe(true);
     expect(Decimal.eq(final.splits[1].amount, "300")).toBe(true);
   });
+
+  // ---------- RANK 等级评估阶段 ----------
+
+  const rankDefs = [
+    { rankId: "V0", levelIndex: 0, rankRate: "0", conditions: [] },
+    { rankId: "V1", levelIndex: 1, rankRate: "15", conditions: [{ field: "directCount", operator: "GTE", value: 3 }] },
+    { rankId: "V3", levelIndex: 3, rankRate: "30", conditions: [{ field: "directCount", operator: "GTE", value: 10 }] },
+  ];
+
+  test("executePipeline — RANK 命中最高等级并写入节点 rankRate（内部自动升序排序）", () => {
+    // rankDefs 传入无序（V0,V3,V1）：RANK handler 应按 levelIndex 升序后评估。
+    const directParent = { id: "u0", directCount: 5 };
+    const weakAncestor = { id: "u1", directCount: 1 };
+    Engine.Orchestrate.executePipeline({
+      stages: [
+        { id: "rank", handler: "RANK", config: { nodes: [directParent, weakAncestor], rankDefs } },
+      ],
+    });
+    // directCount=5 → 满足 V1(≥3)、不满足 V3(≥10) → rankRate 15 / rankId V1
+    expect(directParent.rankRate).toBe("15");
+    expect(directParent.rankId).toBe("V1");
+    // directCount=1 → 未满足 V1 门槛 → 落到 V0 rankRate 0
+    expect(weakAncestor.rankRate).toBe("0");
+  });
+
+  test("executePipeline — RANK 默认不覆盖宿主已预计算的 rankRate", () => {
+    const node = { id: "u0", directCount: 99, rankRate: "50" };
+    Engine.Orchestrate.executePipeline({
+      stages: [{ handler: "RANK", config: { nodes: [node], rankDefs } }],
+    });
+    expect(node.rankRate).toBe("50"); // 保持宿主预计算值
+  });
+
+  test("executePipeline — RANK overwrite=true 覆盖宿主 rankRate", () => {
+    const node = { id: "u0", directCount: 99, rankRate: "50" };
+    Engine.Orchestrate.executePipeline({
+      stages: [{ handler: "RANK", config: { nodes: [node], rankDefs, overwrite: true } }],
+    });
+    // directCount=99 → 满足 V3(≥10) → rankRate 30
+    expect(node.rankRate).toBe("30");
+  });
+
+  test("executePipeline — RANK → DISTRIBUTE 集成：LEVEL 链式消费动态 rankRate", () => {
+    const a1 = { id: "a1", directCount: 5 }; // → V1 15%
+    const a2 = { id: "a2", directCount: 20 }; // → V3 30%
+    const ancestors = [a1, a2];
+    const { final } = Engine.Orchestrate.executePipeline({
+      stages: [
+        { handler: "RANK", config: { nodes: ancestors, rankDefs } },
+        {
+          handler: "DISTRIBUTE",
+          config: {
+            event: { sourceNodeId: "buyer", eventValue: "1000" },
+            ancestors,
+            rewardDefs: [{ rewardId: "team", type: "LEVEL", accumulateInChain: true }],
+          },
+        },
+      ],
+    });
+    // 链式差额：a1 1000×15%=150，水位 15%；a2 1000×(30-15)%=150
+    expect(final.length).toBe(2);
+    expect(Decimal.eq(final[0].amount, "150")).toBe(true);
+    expect(Decimal.eq(final[1].amount, "150")).toBe(true);
+  });
 });
 
 // ====================== Adapters ======================
@@ -754,6 +818,34 @@ describe("Validation", () => {
     });
     expect(error).toBeDefined();
     expect(error.details[0].context.message).toMatch(/fixedAmount/);
+  });
+
+  test("ruleSetConfigSchema - rankDef 携带 rankRate 通过", () => {
+    const { error } = ruleSetConfigSchema.validate({
+      rewardDefs: [{ rewardId: "r1", type: "DIRECT", target: "SOURCE", rate: "100" }],
+      rankDefs: [
+        { rankId: "V0", levelIndex: 0, rankRate: "0", conditions: [] },
+        { rankId: "V1", levelIndex: 1, rankRate: "15", conditions: [{ field: "directCount", operator: "GTE", value: 3 }] },
+      ],
+    });
+    expect(error).toBeUndefined();
+  });
+
+  test("ruleSetConfigSchema - rankRate 超过 1000 失败", () => {
+    const { error } = ruleSetConfigSchema.validate({
+      rewardDefs: [{ rewardId: "r1", type: "DIRECT", target: "SOURCE", rate: "100" }],
+      rankDefs: [{ rankId: "V1", levelIndex: 1, rankRate: "1500", conditions: [] }],
+    });
+    expect(error).toBeDefined();
+  });
+
+  test("ruleSetConfigSchema - pipelineDef 声明 RANK 阶段通过", () => {
+    const { error } = ruleSetConfigSchema.validate({
+      rewardDefs: [{ rewardId: "r1", type: "DIRECT", target: "SOURCE", rate: "100" }],
+      rankDefs: [{ rankId: "MEMBER", levelIndex: 0, conditions: [] }],
+      pipelineDef: { stages: [{ handler: "RANK" }, { handler: "DISTRIBUTE" }, { handler: "CAP" }] },
+    });
+    expect(error).toBeUndefined();
   });
 });
 

@@ -198,4 +198,56 @@ describe("buildPipelineStages", () => {
     expect(stages[0].config.rewardDefs).toBe(defaultRewardDefs);
     expect(stages[1].config.rewardDefs).toBe(defaultRewardDefs);
   });
+
+  const rankDefs = [
+    { rankId: "V0", levelIndex: 0, rankRate: "0", conditions: [] },
+    { rankId: "V1", levelIndex: 1, rankRate: "15", conditions: [{ field: "directCount", operator: "GTE", value: 3 }] },
+    { rankId: "V3", levelIndex: 3, rankRate: "30", conditions: [{ field: "directCount", operator: "GTE", value: 10 }] },
+  ];
+
+  test("RANK 阶段装配：注入 rankDefs 并默认评估 directParent+ancestors（按 id 去重）", () => {
+    const stages = buildPipelineStages(
+      {
+        rewardDefs: defaultRewardDefs,
+        capDefs: defaultCapDefs,
+        rankDefs,
+        pipelineDef: { stages: [{ handler: "RANK" }, { handler: "DISTRIBUTE" }, { handler: "CAP" }] },
+      },
+      makeInput() // directParent u0 + ancestors [u0] → 同 id 去重为 1 个
+    );
+    expect(stages[0].handler).toBe("RANK");
+    expect(stages[0].id).toBe("rank");
+    expect(stages[0].config.rankDefs).toBe(rankDefs);
+    expect(stages[0].config.nodes).toHaveLength(1);
+    expect(stages[0].config.nodes[0].id).toBe("u0");
+    expect(stages[0].config.overwrite).toBe(false);
+  });
+
+  test("RANK 阶段：explicit nodes 覆盖默认，overwrite 透传", () => {
+    const extraNode = { id: "uExt", directCount: 5 };
+    const stages = buildPipelineStages(
+      {
+        rewardDefs: defaultRewardDefs,
+        rankDefs,
+        pipelineDef: { stages: [{ handler: "RANK", config: { nodes: [extraNode], overwrite: true } }] },
+      },
+      makeInput()
+    );
+    expect(stages[0].config.nodes).toEqual([extraNode]);
+    expect(stages[0].config.overwrite).toBe(true);
+  });
+
+  test("RANK 阶段：directParent 为空时仅评估 ancestors", () => {
+    const stages = buildPipelineStages(
+      {
+        rewardDefs: [],
+        capDefs: [],
+        rankDefs,
+        pipelineDef: { stages: [{ handler: "RANK" }] },
+      },
+      makeInput({ directParent: null, ancestors: [{ id: "a1" }, { id: "a2" }, { id: "a1" }] })
+    );
+    // 去空 + 按 id 去重：a1(重复)、a2 → 2 个
+    expect(stages[0].config.nodes).toHaveLength(2);
+  });
 });

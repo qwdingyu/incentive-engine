@@ -100,7 +100,7 @@ if (error) {
 | `EngineEvent` | 激励源事件（eventId/sourceNodeId/eventType/eventValue） |
 | `RewardDef` | 奖励定义（DIRECT/LEVEL/FIXED，配置驱动） |
 | `AllocationTarget` | 分配目标（target + ratio） |
-| `RankDef` | 等级定义（含 conditions 条件列表） |
+| `RankDef` | 等级定义（含 conditions 条件列表 + rankRate 可选） |
 | `Condition` | 条件定义（COMPARE/AND/OR/NOT，支持复合条件树） |
 
 ### Distribute — 奖励分配
@@ -130,6 +130,8 @@ if (error) {
 | `evaluateCondition` | 递归评估条件树（COMPARE/AND/OR/NOT） |
 
 ### Orchestrate — 流水线编排
+
+内置阶段 handler：`DISTRIBUTE`（奖励分配）、`RANK`（等级评估，写入节点 rankRate）、`CAP`（封顶）、`OVER`（预算兜底）、`SPLIT`（金额拆分）。阶段按顺序执行，共享 context（封顶水位）；节点为对象引用，前序阶段对节点的就地修改对后续阶段立即可见。
 
 | 函数 | 用途 |
 |------|------|

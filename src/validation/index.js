@@ -11,7 +11,7 @@
  *   const { ruleSetConfigSchema } = schemas;
  * 这样可以避免 joi 跨包版本不一致导致的 "Cannot mix different versions" 错误。
  *
- * @version 3.1.0
+ * @version 3.2.0
  */
 
 /**
@@ -73,6 +73,8 @@ function createRuleSetValidation(Joi) {
   const rankDefSchema = Joi.object({
     rankId: Joi.string().max(64).required(),
     levelIndex: Joi.number().integer().min(0).required(),
+    // 等级关联的分成比例（百分比整数）：RANK 阶段命中该等级时写入节点 rankRate。
+    rankRate: pctRateSchema,
     conditions: Joi.array().items(conditionSchema).optional(),
     metadata: Joi.object().optional(),
   });
@@ -108,7 +110,7 @@ function createRuleSetValidation(Joi) {
 
   const pipelineStageSchema = Joi.object({
     id: Joi.string().max(64).optional(),
-    handler: Joi.string().valid("DISTRIBUTE", "CAP", "OVER", "SPLIT").required(),
+    handler: Joi.string().valid("DISTRIBUTE", "CAP", "OVER", "SPLIT", "RANK").required(),
     config: pipelineStageConfigSchema.optional(),
   });
 
