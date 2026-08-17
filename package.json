@@ -1,6 +1,6 @@
 {
   "name": "@usethink/incentive-engine",
-  "version": "3.3.0",
+  "version": "3.3.1",
   "description": "通用营销激励引擎 — 领域无关的纯计算核心，支持 DIRECT/LEVEL/FIXED/CUSTOM 奖励分配、封顶裁剪、预算兜底、等级评估、条件评估、流水线编排、配置校验、灰度版本路由",
   "main": "src/index.js",
   "scripts": {

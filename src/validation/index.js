@@ -11,7 +11,7 @@
  *   const { ruleSetConfigSchema } = schemas;
  * 这样可以避免 joi 跨包版本不一致导致的 "Cannot mix different versions" 错误。
  *
- * @version 3.3.0
+ * @version 3.3.1
  */
 
 /**
