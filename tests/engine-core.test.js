@@ -227,6 +227,63 @@ describe("Distribute", () => {
     expect(records.length).toBeGreaterThanOrEqual(1);
     expect(Decimal.eq(records[0].amount, "100")).toBe(true);
   });
+
+  test("distributeByDefs — FIXED SOURCE 固定金额（与事件值无关）", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "0" },
+      rewardDefs: [{ rewardId: "signup_bonus", type: "FIXED", target: "SOURCE", fixedAmount: "88" }],
+    });
+    expect(records.length).toBe(1);
+    expect(records[0].nodeId).toBe("u1");
+    expect(records[0].rewardType).toBe("FIXED");
+    expect(Decimal.eq(records[0].amount, "88")).toBe(true);
+  });
+
+  test("distributeByDefs — FIXED PARENT 固定金额（与事件值无关）", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "1" },
+      directParent: { id: "u0", rankRate: "10" },
+      rewardDefs: [{ rewardId: "per_order", type: "FIXED", target: "PARENT", fixedAmount: "5" }],
+    });
+    expect(records.length).toBe(1);
+    expect(records[0].nodeId).toBe("u0");
+    expect(Decimal.eq(records[0].amount, "5")).toBe(true);
+  });
+
+  test("distributeByDefs — FIXED PARENT skipRankZero 默认跳过最低等级", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "100" },
+      directParent: { id: "u0", rankRate: "0" },
+      rewardDefs: [{ rewardId: "ref", type: "FIXED", target: "PARENT", fixedAmount: "8" }],
+    });
+    expect(records.length).toBe(0);
+  });
+
+  test("distributeByDefs — FIXED PARENT skipRankZero=false 最低等级也发", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "100" },
+      directParent: { id: "u0", rankRate: "0" },
+      rewardDefs: [{ rewardId: "ref", type: "FIXED", target: "PARENT", fixedAmount: "8", skipRankZero: false }],
+    });
+    expect(records.length).toBe(1);
+    expect(Decimal.eq(records[0].amount, "8")).toBe(true);
+  });
+
+  test("distributeByDefs — FIXED fixedAmount=0 不发", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "100" },
+      directParent: { id: "u0", rankRate: "10" },
+      rewardDefs: [{ rewardId: "ref", type: "FIXED", target: "PARENT", fixedAmount: "0" }],
+    });
+    expect(records.length).toBe(0);
+  });
+
+  test("distributeByDefs — FIXED 未知 target 抛错", () => {
+    expect(() => Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "100" },
+      rewardDefs: [{ rewardId: "ref", type: "FIXED", target: "BOGUS", fixedAmount: "8" }],
+    })).toThrow(/FIXED 奖励定义未知 target/);
+  });
 });
 
 // ====================== Allocate ======================
@@ -671,6 +728,32 @@ describe("Validation", () => {
       rankDefs: [{ rankId: "MEMBER", levelIndex: 0, conditions: [] }],
     });
     expect(error).toBeDefined();
+  });
+
+  test("ruleSetConfigSchema - FIXED 类型带 fixedAmount 通过", () => {
+    const { error } = ruleSetConfigSchema.validate({
+      rewardDefs: [{ rewardId: "r1", type: "FIXED", target: "PARENT", fixedAmount: "8" }],
+      rankDefs: [{ rankId: "MEMBER", levelIndex: 0, conditions: [] }],
+    });
+    expect(error).toBeUndefined();
+  });
+
+  test("ruleSetConfigSchema - FIXED 类型缺 fixedAmount 失败", () => {
+    const { error } = ruleSetConfigSchema.validate({
+      rewardDefs: [{ rewardId: "r1", type: "FIXED", target: "PARENT", rate: "5" }],
+      rankDefs: [{ rankId: "MEMBER", levelIndex: 0, conditions: [] }],
+    });
+    expect(error).toBeDefined();
+    expect(error.details[0].context.message).toMatch(/fixedAmount/);
+  });
+
+  test("ruleSetConfigSchema - FIXED fixedAmount=0 失败", () => {
+    const { error } = ruleSetConfigSchema.validate({
+      rewardDefs: [{ rewardId: "r1", type: "FIXED", target: "PARENT", fixedAmount: "0" }],
+      rankDefs: [{ rankId: "MEMBER", levelIndex: 0, conditions: [] }],
+    });
+    expect(error).toBeDefined();
+    expect(error.details[0].context.message).toMatch(/fixedAmount/);
   });
 });
 

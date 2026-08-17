@@ -98,7 +98,7 @@ if (error) {
 |------|------|
 | `EngineNode` | 抽象网络节点（id/parentId/rankId/attrs/tags） |
 | `EngineEvent` | 激励源事件（eventId/sourceNodeId/eventType/eventValue） |
-| `RewardDef` | 奖励定义（DIRECT/LEVEL，配置驱动） |
+| `RewardDef` | 奖励定义（DIRECT/LEVEL/FIXED，配置驱动） |
 | `AllocationTarget` | 分配目标（target + ratio） |
 | `RankDef` | 等级定义（含 conditions 条件列表） |
 | `Condition` | 条件定义（COMPARE/AND/OR/NOT，支持复合条件树） |
@@ -109,6 +109,7 @@ if (error) {
 |------|------|
 | `distributeByDefs` | 遍历 RewardDef 列表驱动分配 |
 | `calculateDirect` | 单条 DIRECT 奖励计算（eventValue × rate） |
+| `calculateFixed` | 单条 FIXED 固定金额奖励计算（不依赖事件金额） |
 | `calculateLevelChain` | 链式水位差分配（极差/多级佣金的通用模式） |
 
 ### Allocate — 封顶/拆分/预算兜底

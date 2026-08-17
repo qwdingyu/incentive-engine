@@ -11,7 +11,7 @@
  *   const { ruleSetConfigSchema } = schemas;
  * 这样可以避免 joi 跨包版本不一致导致的 "Cannot mix different versions" 错误。
  *
- * @version 3.0.0
+ * @version 3.1.0
  */
 
 /**
@@ -52,15 +52,16 @@ function createRuleSetValidation(Joi) {
 
   const rewardDefSchema = Joi.object({
     rewardId: Joi.string().max(64).required(),
-    type: Joi.string().valid("DIRECT", "LEVEL", "CUSTOM").required(),
+    type: Joi.string().valid("DIRECT", "LEVEL", "FIXED", "CUSTOM").required(),
     rate: pctRateSchema,
+    fixedAmount: nonNegativeSchema,
     target: Joi.string().valid("SOURCE", "PARENT").optional(),
     skipRankZero: Joi.boolean().optional(),
     accumulateInChain: Joi.boolean().optional(),
     allocatorId: Joi.string().max(64).allow(null).optional(),
     conditions: Joi.array().items(Joi.object()).optional(),
     metadata: Joi.object().optional(),
-  });
+  }).custom(validateRewardFixedAmount, "FIXED 固定金额交叉校验");
 
   const conditionSchema = Joi.object({
     field: Joi.string().max(64).required(),
@@ -115,7 +116,25 @@ function createRuleSetValidation(Joi) {
     stages: Joi.array().items(pipelineStageSchema).min(1).required(),
   });
 
-  // ==================== 唯一性校验器 ====================
+  // ==================== 唯一性/交叉校验器 ====================
+
+  /**
+   * FIXED 类型交叉校验：type="FIXED" 时必须提供大于 0 的 fixedAmount。
+   * 防止配置作者误把 FIXED 当 DIRECT 用（只写 rate 不写 fixedAmount），
+   * 或 fixedAmount 配成 0，导致引擎静默不发奖/不可预期的行为。
+   */
+  function validateRewardFixedAmount(value, helpers) {
+    if (value.type === "FIXED") {
+      const fa = value.fixedAmount;
+      const ok = fa !== undefined && fa !== null && fa !== "" && Number(fa) > 0;
+      if (!ok) {
+        return helpers.error("any.custom", {
+          message: `FIXED 奖励类型必须提供大于 0 的 fixedAmount（rewardId=${value.rewardId}）`,
+        });
+      }
+    }
+    return value;
+  }
 
   function validateRewardIdUniqueness(arr, helpers) {
     const ids = arr.map((d) => d.rewardId);
