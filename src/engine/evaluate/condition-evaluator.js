@@ -37,15 +37,18 @@ const Decimal = require("../../decimal");
  */
 function _resolveField(data, field, subKey) {
   if (!data) return 0;
-  if (field === "directCount") return data.directCount ?? data.attrs?.directCount ?? 0;
-  if (field === "teamPerformance") return data.teamPerformance ?? data.attrs?.teamPerformance ?? "0";
+  // 三个硬编码字段名优先级与通用分支一致（attrs 优先），
+  // 避免"某字段读顶层、另一字段读 attrs"的不一致行为。
+  // 等级评估（rank-evaluator）直接读取 node.directCount 等，不经过此函数，零影响。
+  if (field === "directCount") return data.attrs?.directCount ?? data.directCount ?? 0;
+  if (field === "teamPerformance") return data.attrs?.teamPerformance ?? data.teamPerformance ?? "0";
   if (field === "higherTierCounts") {
     if (subKey !== undefined && subKey !== null) {
       return (data.higherTierCounts && data.higherTierCounts[subKey]) || 0;
     }
-    return data.higherTierCount ?? data.attrs?.higherTierCount ?? 0;
+    return data.attrs?.higherTierCount ?? data.higherTierCount ?? 0;
   }
-  // 从 attrs 或 data 直接读取（任意自定义字段）
+  // 通用分支：任意自定义字段，attrs 优先（与上面三个硬编码字段一致的优先级）
   return data.attrs?.[field] ?? data[field] ?? 0;
 }
 
