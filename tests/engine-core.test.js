@@ -883,6 +883,23 @@ describe("Orchestrate", () => {
     expect(Decimal.eq(final.splits[1].amount, "300")).toBe(true);
   });
 
+  test("executePipeline — SPLIT 后跟其他阶段报错（防输入格式不兼容崩溃）", () => {
+    // SPLIT 输出 { splits, snapshot } 非记录数组，与 CAP 等后续阶段不兼容。
+    // schema 允许任意阶段组合，引擎必须在 SPLIT 后跟阶段时提前报错而非静默崩溃。
+    expect(() => Engine.Orchestrate.executePipeline({
+      stages: [
+        { id: "distribute", handler: "DISTRIBUTE", config: {
+          event: { sourceNodeId: "u1", eventValue: "1000" },
+          directParent: { id: "u0", rankRate: "10" },
+          ancestors: [],
+          rewardDefs: [{ rewardId: "ref", type: "DIRECT", target: "PARENT", rate: "10" }],
+        } },
+        { id: "split", handler: "SPLIT", config: { totalAmount: "100", targets: [{ target: "A", ratio: "70" }] } },
+        { id: "cap", handler: "CAP", config: { capDefs: [{ capId: "day", scope: "PER_USER_DAILY", limit: "50" }] } },
+      ],
+    })).toThrow("SPLIT 必须是最后一个阶段");
+  });
+
   // ---------- RANK 等级评估阶段 ----------
 
   const rankDefs = [

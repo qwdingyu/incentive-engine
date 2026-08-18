@@ -100,6 +100,16 @@ function executePipeline({ stages = [], context = {} }) {
       if (config.totalAmount === undefined || config.totalAmount === null) {
         throw new Error("SPLIT 阶段缺少 totalAmount（独立阶段，需显式传入待拆分金额）");
       }
+      // SPLIT 输出 { splits, snapshot } 非记录数组，与后续阶段（CAP）不兼容，
+      // 因此 SPLIT 必须是最后一个阶段。若后续还有阶段，提前报错而非静默崩溃。
+      const stageIndex = stage.id || stage.handler || "?";
+      const remainingStages = stages.slice(stages.indexOf(stage) + 1).filter((s) => s);
+      if (remainingStages.length > 0) {
+        throw new Error(
+          `SPLIT 阶段 "${stageIndex}" 后还有 ${remainingStages.length} 个阶段（${remainingStages.map((s) => s.handler || s.id).join(", ")}），` +
+          "SPLIT 必须是最后一个阶段，否则后续阶段会因输入格式不兼容而崩溃"
+        );
+      }
       current = splitByTargets(config.totalAmount, config.targets);
     } else {
       throw new Error(`未知流水线阶段 handler: "${handler}"（支持: DISTRIBUTE, RANK, CAP, OVER, SPLIT）`);
