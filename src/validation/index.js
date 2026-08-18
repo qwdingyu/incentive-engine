@@ -67,7 +67,7 @@ function createRuleSetValidation(Joi) {
 
   const conditionSchema = Joi.object({
     field: Joi.string().max(64).required(),
-    operator: Joi.string().valid("GTE", "GT", "LTE", "LT", "EQ").required(),
+    operator: Joi.string().valid("GTE", "GT", "LTE", "LT", "EQ", "NE").required(),
     value: Joi.alternatives().try(Joi.string(), Joi.number()).required(),
     subKey: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null).optional(),
   });

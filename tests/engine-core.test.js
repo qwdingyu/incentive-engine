@@ -564,6 +564,19 @@ describe("Allocate", () => {
     expect(Decimal.eq(capped[0].amount, "10")).toBe(true);
   });
 
+  test("applyCaps — ALERT_ONLY 超限不裁剪，保留原金额带告警标记", () => {
+    const records = [{ nodeId: "u1", amount: "200" }];
+    const state = { platformPaid: "190", memberPaid: new Map() };
+    // REJECT 语义会裁剪到 10；ALERT_ONLY 应保留 200 并标记 alertOnly
+    const capped = Engine.Allocate.applyCaps(records, [
+      { capId: "p1", scope: "PLATFORM_DAILY", limit: "200", onExceed: "ALERT_ONLY" },
+    ], state);
+    expect(capped.length).toBe(1);
+    expect(Decimal.eq(capped[0].amount, "200")).toBe(true); // 保留原金额
+    expect(capped[0].snapshot.payoutCaps.alertOnly).toBe(true);
+    expect(capped[0].snapshot.payoutCaps.onExceed).toBe("ALERT_ONLY");
+  });
+
   test("applyCaps — 多个记录推进水位", () => {
     const records = [
       { nodeId: "u1", amount: "100" },

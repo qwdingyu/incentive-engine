@@ -34,14 +34,27 @@ function applyCaps(records, capDefs = [], state = { platformPaid: "0", memberPai
   const memberCap = capDefs.find((c) => c.scope === "PER_USER_DAILY" && Decimal.gt(c.limit, "0"));
   const dailyPlatformPayoutCap = platformCap ? String(platformCap.limit) : "0";
   const memberDailyYieldCap = memberCap ? String(memberCap.limit) : "0";
+  // onExceed 语义：REJECT（默认）= 超出丢弃；ALERT_ONLY = 超出不裁剪、保留原金额，仅记录告警标记。
+  // 此前 applyCaps 完全不读取 onExceed，ALERT_ONLY 配置被静默当作 REJECT 处理（资金行为错误）。
+  const platformOnExceed = platformCap?.onExceed || "REJECT";
+  const memberOnExceed = memberCap?.onExceed || "REJECT";
 
   for (const record of records) {
     let allowedAmount = record.amount;
+    let alertOnly = false;
 
     // 平台日封顶先裁剪：平台水位代表当天所有接收人的累计发放额。
     if (Decimal.gt(dailyPlatformPayoutCap, "0")) {
       const platformRemaining = Decimal.sub(dailyPlatformPayoutCap, state.platformPaid || "0");
-      allowedAmount = Decimal.min(allowedAmount, platformRemaining);
+      if (Decimal.lt(allowedAmount, platformRemaining)) {
+        // 未超限，正常
+      } else if (platformOnExceed === "ALERT_ONLY") {
+        // ALERT_ONLY：超限不裁剪，保留原金额，标记告警
+        alertOnly = true;
+      } else {
+        // REJECT（默认）：裁剪到剩余额度
+        allowedAmount = Decimal.min(allowedAmount, platformRemaining);
+      }
     }
 
     // 单用户日封顶再裁剪：同一节点可同时拿多类收益，必须合并计算当天额度。
@@ -49,7 +62,15 @@ function applyCaps(records, capDefs = [], state = { platformPaid: "0", memberPai
       const nodeId = record.nodeId ?? record.memberId;
       const memberPaid = state.memberPaid.get(nodeId) || "0";
       const memberRemaining = Decimal.sub(memberDailyYieldCap, memberPaid);
-      allowedAmount = Decimal.min(allowedAmount, memberRemaining);
+      if (Decimal.lt(allowedAmount, memberRemaining)) {
+        // 未超限，正常
+      } else if (memberOnExceed === "ALERT_ONLY") {
+        // ALERT_ONLY：超限不裁剪，保留原金额，标记告警
+        alertOnly = true;
+      } else {
+        // REJECT（默认）：裁剪到剩余额度
+        allowedAmount = Decimal.min(allowedAmount, memberRemaining);
+      }
     }
 
     // 没有剩余额度的记录直接丢弃，不写 0 金额收益，避免对账报表出现无意义流水。
@@ -64,6 +85,8 @@ function applyCaps(records, capDefs = [], state = { platformPaid: "0", memberPai
         memberDailyYieldCap,
         originalAmount: record.amount,
         cappedAmount: allowedAmount,
+        // ALERT_ONLY 超发告警标记：运营可据此识别"超发但保留"的记录
+        ...(alertOnly ? { alertOnly: true, onExceed: "ALERT_ONLY" } : {}),
       },
     };
     cappedRecords.push(cappedRecord);
