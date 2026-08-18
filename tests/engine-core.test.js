@@ -205,6 +205,18 @@ describe("Distribute", () => {
     }
   });
 
+  test("distributeByDefs — conditions 带空格数字不崩溃（trim 规范化）", () => {
+    // 业务事件字段值可能带空格（如 " 2000 "），decimal.js 不接受带空格数字
+    // 引擎应 trim 后比较，不崩溃
+    const event = { sourceNodeId: "u1", eventValue: "1000", attrs: { orderAmount: " 2000 " } };
+    const records = Engine.Distribute.distributeByDefs({
+      event,
+      directParent: { id: "u0", rankRate: "10" },
+      rewardDefs: [{ rewardId: "ref", type: "DIRECT", target: "PARENT", rate: "5", conditions: [{ field: "orderAmount", operator: "GTE", value: 1000 }] }],
+    });
+    expect(records.length).toBe(1); // 2000 >= 1000 → 发放
+  });
+
   test("distributeByDefs — DIRECT PARENT rate=0 不发", () => {
     const records = Engine.Distribute.distributeByDefs({
       event: { sourceNodeId: "u1", eventValue: "1000" },

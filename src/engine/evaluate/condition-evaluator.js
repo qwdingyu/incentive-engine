@@ -60,25 +60,40 @@ function _resolveField(data, field, subKey) {
 function _evaluateCompare(condition, data) {
   const actual = _resolveField(data, condition.field, condition.subKey);
   const expected = condition.value;
+  // 统一 trim 后判断：decimal.js 不接受带空格数字（" 5 " 崩溃），
+  // _isNumeric 与 Decimal 比较必须使用同一规范化值（trim 后），避免误判崩溃
+  const actualStr = _toComparable(actual);
+  const expectedStr = _toComparable(expected);
   switch (condition.operator) {
-    case "GTE": return _isNumeric(actual) && _isNumeric(expected) ? Decimal.gte(String(actual), String(expected)) : false;
-    case "GT":  return _isNumeric(actual) && _isNumeric(expected) ? Decimal.gt(String(actual), String(expected)) : false;
-    case "LTE": return _isNumeric(actual) && _isNumeric(expected) ? Decimal.lte(String(actual), String(expected)) : false;
-    case "LT":  return _isNumeric(actual) && _isNumeric(expected) ? Decimal.lt(String(actual), String(expected)) : false;
+    case "GTE": return _isNumeric(actualStr) && _isNumeric(expectedStr) ? Decimal.gte(actualStr, expectedStr) : false;
+    case "GT":  return _isNumeric(actualStr) && _isNumeric(expectedStr) ? Decimal.gt(actualStr, expectedStr) : false;
+    case "LTE": return _isNumeric(actualStr) && _isNumeric(expectedStr) ? Decimal.lte(actualStr, expectedStr) : false;
+    case "LT":  return _isNumeric(actualStr) && _isNumeric(expectedStr) ? Decimal.lt(actualStr, expectedStr) : false;
     case "EQ":
       // 数值字段走 Decimal 精确比较；非数值（如等级标识 "V3"）走字符串相等
-      return _isNumeric(actual) && _isNumeric(expected)
-        ? Decimal.eq(String(actual), String(expected))
-        : String(actual) === String(expected);
+      return _isNumeric(actualStr) && _isNumeric(expectedStr)
+        ? Decimal.eq(actualStr, expectedStr)
+        : actualStr === expectedStr;
     case "NE":
       // 与 EQ 对称：数值走 Decimal，非数值走字符串不等
-      return _isNumeric(actual) && _isNumeric(expected)
-        ? !Decimal.eq(String(actual), String(expected))
-        : String(actual) !== String(expected);
+      return _isNumeric(actualStr) && _isNumeric(expectedStr)
+        ? !Decimal.eq(actualStr, expectedStr)
+        : actualStr !== expectedStr;
     default:
       // 未知操作符视为不满足，避免静默放行
       return false;
   }
+}
+
+/**
+ * 将值规范化为可比较字符串（trim + String 化）
+ * @private
+ * @param {*} value
+ * @returns {string}
+ */
+function _toComparable(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).trim();
 }
 
 /**
