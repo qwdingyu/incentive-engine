@@ -65,12 +65,32 @@ function _evaluateCompare(condition, data) {
     case "GT":  return Decimal.gt(String(actual), String(expected));
     case "LTE": return Decimal.lte(String(actual), String(expected));
     case "LT":  return Decimal.lt(String(actual), String(expected));
-    case "EQ":  return Decimal.eq(String(actual), String(expected));
-    case "NE":  return !Decimal.eq(String(actual), String(expected));
+    case "EQ":
+      // 数值字段走 Decimal 精确比较；非数值（如等级标识 "V3"）走字符串相等
+      return _isNumeric(actual) && _isNumeric(expected)
+        ? Decimal.eq(String(actual), String(expected))
+        : String(actual) === String(expected);
+    case "NE":
+      // 与 EQ 对称：数值走 Decimal，非数值走字符串不等
+      return _isNumeric(actual) && _isNumeric(expected)
+        ? !Decimal.eq(String(actual), String(expected))
+        : String(actual) !== String(expected);
     default:
       // 未知操作符视为不满足，避免静默放行
       return false;
   }
+}
+
+/**
+ * 判断值是否为可解析的数值（Decimal 可安全处理）
+ * @private
+ * @param {*} value
+ * @returns {boolean}
+ */
+function _isNumeric(value) {
+  if (value === null || value === undefined || value === "") return false;
+  const str = String(value);
+  return str.trim() !== "" && !isNaN(Number(str));
 }
 
 /**

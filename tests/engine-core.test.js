@@ -103,6 +103,93 @@ describe("Distribute", () => {
     expect(Decimal.eq(records[0].amount, "50")).toBe(true);
   });
 
+  test("distributeByDefs — conditions 满足时发放（event.attrs 字段）", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "1000", attrs: { orderAmount: "2000" } },
+      directParent: { id: "u0", rankRate: "10" },
+      rewardDefs: [
+        {
+          rewardId: "ref",
+          type: "DIRECT",
+          target: "PARENT",
+          rate: "5",
+          conditions: [{ field: "orderAmount", operator: "GTE", value: 1000 }],
+        },
+      ],
+    });
+    expect(records.length).toBe(1);
+    expect(records[0].nodeId).toBe("u0");
+    expect(Decimal.eq(records[0].amount, "50")).toBe(true);
+  });
+
+  test("distributeByDefs — conditions 不满足时跳过该奖励（防静默超发）", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "1000", attrs: { orderAmount: "500" } },
+      directParent: { id: "u0", rankRate: "10" },
+      rewardDefs: [
+        {
+          rewardId: "ref",
+          type: "DIRECT",
+          target: "PARENT",
+          rate: "5",
+          conditions: [{ field: "orderAmount", operator: "GTE", value: 1000 }],
+        },
+      ],
+    });
+    expect(records.length).toBe(0);
+  });
+
+  test("distributeByDefs — conditions 复合 AND 全部满足才发放", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "1000", attrs: { orderAmount: "2000", vip: "V3" } },
+      directParent: { id: "u0", rankRate: "10" },
+      rewardDefs: [
+        {
+          rewardId: "ref",
+          type: "DIRECT",
+          target: "PARENT",
+          rate: "5",
+          conditions: [
+            { field: "orderAmount", operator: "GTE", value: 1000 },
+            { field: "vip", operator: "EQ", value: "V3" },
+          ],
+        },
+      ],
+    });
+    expect(records.length).toBe(1);
+  });
+
+  test("distributeByDefs — conditions 复合 AND 任一不满足则跳过", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "1000", attrs: { orderAmount: "2000", vip: "V1" } },
+      directParent: { id: "u0", rankRate: "10" },
+      rewardDefs: [
+        {
+          rewardId: "ref",
+          type: "DIRECT",
+          target: "PARENT",
+          rate: "5",
+          conditions: [
+            { field: "orderAmount", operator: "GTE", value: 1000 },
+            { field: "vip", operator: "EQ", value: "V3" },
+          ],
+        },
+      ],
+    });
+    expect(records.length).toBe(0);
+  });
+
+  test("distributeByDefs — conditions 为空数组时正常发放（向后兼容）", () => {
+    const records = Engine.Distribute.distributeByDefs({
+      event: { sourceNodeId: "u1", eventValue: "1000" },
+      directParent: { id: "u0", rankRate: "10" },
+      rewardDefs: [
+        { rewardId: "ref", type: "DIRECT", target: "PARENT", rate: "5", conditions: [] },
+      ],
+    });
+    expect(records.length).toBe(1);
+  });
+
   test("distributeByDefs — DIRECT PARENT rate=0 不发", () => {
     const records = Engine.Distribute.distributeByDefs({
       event: { sourceNodeId: "u1", eventValue: "1000" },

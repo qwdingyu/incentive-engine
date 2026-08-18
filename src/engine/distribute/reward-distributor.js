@@ -17,6 +17,31 @@
 const Decimal = require("../../decimal");
 const { calculateDirect, calculateFixed, calculateCustom, resolveCustomAmount } = require("./direct-calculator");
 const { calculateLevelChain } = require("./chain-calculator");
+const { evaluateCondition } = require("../evaluate/condition-evaluator");
+
+/**
+ * 评估奖励定义的条件（rewardDef.conditions），不满足则跳过该奖励
+ *
+ * 数据源 = 事件对象（event 含 attrs），与 condition-evaluator._resolveField 的
+ * attrs 回退兼容（如 `{ field: "orderAmount", operator: "GTE", value: 1000 }`
+ * 会读取 event.attrs.orderAmount）。语义：
+ *   - conditions 为空/未配置 → true（发放）
+ *   - conditions 配置但数据源无匹配字段 → 字段解析为 0，条件大概率不满足 → false（跳过）
+ *
+ * @private
+ * @param {Object} def - RewardDef { conditions? }
+ * @param {Object} event - EngineEvent { eventValue, attrs? }
+ * @returns {boolean} 是否应发放该奖励
+ */
+function _meetsRewardCondition(def, event) {
+  const conditions = def.conditions;
+  if (!Array.isArray(conditions) || conditions.length === 0) return true;
+  // 兼容两种格式：纯 COMPARE 数组包装为 AND；单个复合条件（AND/OR/NOT）直接评估
+  const wrapper = conditions.length === 1 && conditions[0].type
+    ? conditions[0]
+    : { type: "AND", children: conditions.map((c) => (c.type ? c : { type: "COMPARE", ...c })) };
+  return evaluateCondition(wrapper, event);
+}
 
 /**
  * 按奖励定义列表分发事件奖励（通用纯计算）
@@ -40,6 +65,11 @@ function distributeByDefs({ event, directParent = null, ancestors = [], rewardDe
   for (const def of rewardDefs) {
     if (!def || !def.type) {
       throw new Error(`奖励定义无效: ${JSON.stringify(def)}（必须包含 type 字段）`);
+    }
+    // 奖励发放条件评估：conditions 配置且不满足时跳过该奖励（防静默超发，
+    // 曾为"配置了但未评估"的资金安全死角，见 engine 3.4.0 修复）
+    if (!_meetsRewardCondition(def, event)) {
+      continue;
     }
     if (def.type === "DIRECT") {
       if (def.target === "SOURCE") {
