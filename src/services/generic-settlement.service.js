@@ -108,6 +108,12 @@ class GenericSettlementService {
     if (!preReadWhere || typeof preReadWhere !== "object") {
       return { ok: false, message: "幂等键预读条件必须返回非空对象" };
     }
+    // 防御：空 where 对象（{}）会导致 findAll({ where: {} }) 返回全表，
+    // 所有新事件被误判为幂等命中而静默不落账（资金安全边界）。
+    // 幂等键必须至少有一个字段，否则视为配置错误拒绝。
+    if (Object.keys(preReadWhere).length === 0) {
+      return { ok: false, message: "幂等键预读条件不能为空对象（必须包含至少一个幂等键字段）" };
+    }
     // 根据 JSON 序列化字段名占位符判断缺失——未显式传值的字段在实际 Sequelize 查询中会传 undefined。
     const missingKeys = [];
     for (const [key, value] of Object.entries(preReadWhere)) {

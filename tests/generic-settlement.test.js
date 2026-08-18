@@ -179,6 +179,20 @@ describe("GenericSettlementService", () => {
       const result = svc._validateEvent({ orderNo: "O001", buyerId: "u1", amount: "1000" });
       expect(result.ok).toBe(true);
     });
+
+    test("空幂等键 where 返回 { ok: false }（防御 findAll 全表）", () => {
+      // buildPreReadWhere 返回 {} 时，findAll({ where: {} }) 返回全表，
+      // 所有新事件被误判为幂等命中而静默不落账（资金安全边界）。
+      const svc = new GenericSettlementService(makeMinimalConfig({
+        idempotency: {
+          buildPreReadWhere: () => ({}),
+          buildFallbackWhere: (e) => ({}),
+        },
+      }));
+      const result = svc._validateEvent({ orderNo: "O001" });
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain("不能为空");
+    });
   });
 
   // ---------- settle ----------
