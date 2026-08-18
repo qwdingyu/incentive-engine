@@ -614,6 +614,22 @@ describe("Allocate", () => {
     expect(Decimal.lt(result[1].amount, "100")).toBe(true);
   });
 
+  test("applyBudgetGuard — CAP 缩减后求和精确等于预算上限（最大剩余法防累积超发）", () => {
+    // 3 条 100/100/100，预算 200（totalBudget=40%，eventValue=500）
+    // 朴素四舍五入：66.67×3=200.01 超发 0.01；最大剩余法应精确 = 200
+    const records = [{ nodeId: "a", amount: "100" }, { nodeId: "b", amount: "100" }, { nodeId: "c", amount: "100" }];
+    const result = Engine.Allocate.applyBudgetGuard(records, {
+      totalBudget: "40", eventValue: "500", onExceed: "CAP",
+    });
+    const sum = result.reduce((s, r) => Decimal.add(s, r.amount), "0");
+    expect(Decimal.eq(sum, "200")).toBe(true); // 精确等于预算上限，无累积超发
+    // 每条金额在 4 位小数内
+    for (const r of result) {
+      expect(Decimal.lte(r.amount, "66.6667")).toBe(true);
+      expect(Decimal.gte(r.amount, "66.6666")).toBe(true);
+    }
+  });
+
   test("applyBudgetGuard — WARN 不修改金额", () => {
     const records = [{ nodeId: "u1", amount: "200" }];
     const context = {};

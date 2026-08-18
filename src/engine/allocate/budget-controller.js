@@ -168,25 +168,55 @@ function applyBudgetGuard(records, config, context = {}) {
   }
 
   if (onExceed === "CAP") {
-    // 按比例缩减，保留相对比例关系
-    const ratio = Decimal.div(budgetLimit, totalAmount);
-    return records.map((r) => {
-      const newAmount = Decimal.mul(r.amount || "0", ratio);
+    // 按比例缩减，保留相对比例关系。
+    // 精度处理：包装层 mul/div 默认四舍五入到 4 位，直接用会产生累积误差，
+    // 导致缩减后求和 > 预算上限（系统性超发）。因此用裸 decimal.js 全精度计算
+    // + 「最大剩余法」：按比例取 4 位 floor，再把差额按余数从大到小分配给
+    // 余数最大的前 N 条（每条 +0.0001），保证缩减后求和精确等于预算上限。
+    const Dec = require("decimal.js"); // 全精度计算（包装层 4 位精度不足，最大剩余法需精确比例）
+    const ratio = new Dec(budgetLimit).div(new Dec(totalAmount));
+    const pow4 = new Dec("10000");
+    const unit = new Dec("0.0001");
+
+    // 1) 每条按比例取 4 位小数（向下取整）
+    const floors = records.map((r) => {
+      const exact = new Dec(r.amount || "0").mul(ratio);
+      return exact.mul(pow4).floor().div(pow4);
+    });
+    // 2) 计算差额（预算上限 - sum(floor)），以最小单位计
+    let floorSum = new Dec("0");
+    for (const f of floors) floorSum = floorSum.plus(f);
+    const remainderUnits = new Dec(budgetLimit).sub(floorSum).div(unit).toNumber();
+    // 3) 按余数从大到小排序记录索引（余数相同保持原顺序，保证确定性）
+    const remainderOrder = records.map((r, i) => {
+      const exact = new Dec(r.amount || "0").mul(ratio);
+      const frac = exact.sub(floors[i]);
+      return { i, frac };
+    }).sort((a, b) => {
+      if (b.frac.gt(a.frac)) return 1;
+      if (b.frac.lt(a.frac)) return -1;
+      return a.i - b.i;
+    });
+    // 4) 把差额逐条 +0.0001 分配给余数最大的记录，其余保持 floor
+    const bumpSet = new Set(remainderOrder.slice(0, remainderUnits).map((e) => e.i));
+    const result = records.map((r, i) => {
+      const cappedAmount = bumpSet.has(i) ? floors[i].plus(unit) : floors[i];
       return {
         ...r,
-        amount: newAmount,
+        amount: cappedAmount.toString(),
         snapshot: {
           ...(r.snapshot || {}),
           overBudget: {
             originalAmount: r.amount,
-            cappedAmount: newAmount,
+            cappedAmount: cappedAmount.toString(),
             totalAmount,
             budgetLimit,
-            ratio: Decimal.round(Decimal.mul(ratio, "100"), 4) + "%",
+            ratio: Decimal.round(Decimal.mul(ratio.toString(), "100"), 4) + "%",
           },
         },
       };
     });
+    return result;
   }
 
   // 未知 onExceed 值
