@@ -190,6 +190,21 @@ describe("Distribute", () => {
     expect(records.length).toBe(1);
   });
 
+  test("distributeByDefs — conditions 非数值字段 GTE/GT/LTE/LT 不崩溃返回 false", () => {
+    // 运营配置了 { field: "vip", operator: "GTE", value: "V3" }（非数值字段大小比较）
+    // 引擎不应崩溃，应安全返回 false（条件不满足，跳过奖励）
+    const event = { sourceNodeId: "u1", eventValue: "1000", attrs: { vip: "V3" } };
+    const ops = ["GTE", "GT", "LTE", "LT"];
+    for (const op of ops) {
+      const records = Engine.Distribute.distributeByDefs({
+        event,
+        directParent: { id: "u0", rankRate: "10" },
+        rewardDefs: [{ rewardId: "ref", type: "DIRECT", target: "PARENT", rate: "5", conditions: [{ field: "vip", operator: op, value: "V2" }] }],
+      });
+      expect(records.length).toBe(0); // 非数值大小比较 → 安全返回 false → 跳过
+    }
+  });
+
   test("distributeByDefs — DIRECT PARENT rate=0 不发", () => {
     const records = Engine.Distribute.distributeByDefs({
       event: { sourceNodeId: "u1", eventValue: "1000" },

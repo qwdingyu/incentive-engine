@@ -61,10 +61,10 @@ function _evaluateCompare(condition, data) {
   const actual = _resolveField(data, condition.field, condition.subKey);
   const expected = condition.value;
   switch (condition.operator) {
-    case "GTE": return Decimal.gte(String(actual), String(expected));
-    case "GT":  return Decimal.gt(String(actual), String(expected));
-    case "LTE": return Decimal.lte(String(actual), String(expected));
-    case "LT":  return Decimal.lt(String(actual), String(expected));
+    case "GTE": return _isNumeric(actual) && _isNumeric(expected) ? Decimal.gte(String(actual), String(expected)) : false;
+    case "GT":  return _isNumeric(actual) && _isNumeric(expected) ? Decimal.gt(String(actual), String(expected)) : false;
+    case "LTE": return _isNumeric(actual) && _isNumeric(expected) ? Decimal.lte(String(actual), String(expected)) : false;
+    case "LT":  return _isNumeric(actual) && _isNumeric(expected) ? Decimal.lt(String(actual), String(expected)) : false;
     case "EQ":
       // 数值字段走 Decimal 精确比较；非数值（如等级标识 "V3"）走字符串相等
       return _isNumeric(actual) && _isNumeric(expected)
