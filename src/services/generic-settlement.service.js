@@ -336,6 +336,20 @@ class GenericSettlementService {
       return { ok: false, message: "buildEvent 必须返回包含 sourceNodeId 与 eventValue 的对象" };
     }
 
+    // 2a. 将业务事件中未被 buildEvent 使用的字段注入 engineEvent.attrs
+    //     （供 rewardDef.conditions 条件评估使用，如 event.attrs.orderAmount）。
+    //     若 config 的 buildEvent 已显式设置 attrs，则保留不覆盖。
+    //     排除引擎标准字段（sourceNodeId/eventType/eventValue）和元字段（ruleSetCode/extra）。
+    if (!engineEvent.attrs) {
+      engineEvent.attrs = {};
+    }
+    const stdFields = new Set(["sourceNodeId", "eventType", "eventValue", "ruleSetCode", "extra"]);
+    for (const [key, value] of Object.entries(businessEvent)) {
+      if (!stdFields.has(key) && !(key in engineEvent) && !(key in engineEvent.attrs)) {
+        engineEvent.attrs[key] = value;
+      }
+    }
+
     // 3. 构建直接上级和祖先链
     const directParent = this.buildDirectParent(businessEvent);
     const ancestors = this.buildAncestors(businessEvent);

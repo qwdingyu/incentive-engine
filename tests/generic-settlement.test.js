@@ -223,6 +223,68 @@ describe("GenericSettlementService", () => {
       expect(postProcess.mock.calls[0][2]).toBe(tx);
     });
 
+    test("业务事件额外字段注入 engineEvent.attrs（供 conditions 评估）", async () => {
+      const tx = makeMockTransaction();
+      const cfg = makeMinimalConfig();
+      cfg.model.findAll.mockResolvedValue([]);
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.ruleSetService.getActiveRuleSet.mockResolvedValue({ success: true, data: { config_json: { rewardDefs: [{ rewardId: "commission", type: "DIRECT", target: "PARENT", rate: "10" }] } } });
+      mockBuildPipelineStages.mockReturnValue([{ id: "distribute", handler: "DISTRIBUTE", config: {} }]);
+      mockExecutePipeline.mockReturnValue({
+        results: { distribute: [{ rewardId: "commission", nodeId: "u0", amount: "100" }] },
+        final: [{ rewardId: "commission", nodeId: "u0", amount: "100" }],
+        context: {},
+      });
+      cfg.model.create.mockResolvedValue({ id: 1, order_no: "O001", reward_id: "commission", amount: "100" });
+      const svc = new GenericSettlementService(cfg);
+
+      // 业务事件含 orderAmount/vip 等额外字段（buildEvent 未使用）
+      await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000", orderAmount: "2000", vip: "V3" });
+
+      // buildPipelineStages 收到的 event 必须含 attrs（orderAmount/vip 注入）
+      const stagesArg = mockBuildPipelineStages.mock.calls[0][1];
+      expect(stagesArg.event.attrs).toBeDefined();
+      expect(stagesArg.event.attrs.orderAmount).toBe("2000");
+      expect(stagesArg.event.attrs.vip).toBe("V3");
+      // 标准字段不注入 attrs
+      expect(stagesArg.event.attrs.sourceNodeId).toBeUndefined();
+      expect(stagesArg.event.attrs.eventValue).toBeUndefined();
+      // 引擎标准字段保留在 event 顶层
+      expect(stagesArg.event.sourceNodeId).toBe("u1");
+      expect(stagesArg.event.eventValue).toBe("1000");
+    });
+
+    test("buildEvent 已显式设置 attrs 时保留不覆盖", async () => {
+      const tx = makeMockTransaction();
+      const cfg = makeMinimalConfig({
+        buildEvent: (event) => ({
+          sourceNodeId: event.buyerId,
+          eventType: "purchase",
+          eventValue: String(event.amount),
+          attrs: { custom: "preserved" },
+        }),
+      });
+      cfg.model.findAll.mockResolvedValue([]);
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.ruleSetService.getActiveRuleSet.mockResolvedValue({ success: true, data: { config_json: { rewardDefs: [{ rewardId: "commission", type: "DIRECT", target: "PARENT", rate: "10" }] } } });
+      mockBuildPipelineStages.mockReturnValue([{ id: "distribute", handler: "DISTRIBUTE", config: {} }]);
+      mockExecutePipeline.mockReturnValue({
+        results: { distribute: [{ rewardId: "commission", nodeId: "u0", amount: "100" }] },
+        final: [{ rewardId: "commission", nodeId: "u0", amount: "100" }],
+        context: {},
+      });
+      cfg.model.create.mockResolvedValue({ id: 1, order_no: "O001", reward_id: "commission", amount: "100" });
+      const svc = new GenericSettlementService(cfg);
+
+      await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000", orderAmount: "2000" });
+
+      const stagesArg = mockBuildPipelineStages.mock.calls[0][1];
+      // 显式 attrs 保留
+      expect(stagesArg.event.attrs.custom).toBe("preserved");
+      // 额外字段仍注入（不覆盖显式 attrs 已有键）
+      expect(stagesArg.event.attrs.orderAmount).toBe("2000");
+    });
+
     test("UniqueConstraintError 兜底", async () => {
       const tx = makeMockTransaction();
       const cfg = makeMinimalConfig();
