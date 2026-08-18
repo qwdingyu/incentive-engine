@@ -450,6 +450,12 @@ class GenericSettlementService {
 
     if (isUniqueConstraint) {
       const fallbackWhere = this.idempotency.buildFallbackWhere(businessEvent);
+      // 防御：空兜底查询条件会 findAll({ where: {} }) 返回全表，
+      // 把无关记录当作幂等成功返回（与 _validateEvent 空 where 同类的数据泄漏边界）。
+      if (!fallbackWhere || typeof fallbackWhere !== "object" || Object.keys(fallbackWhere).length === 0) {
+        this.log.error(`唯一约束冲突但兜底查询条件为空: ${err.message}`, { orderNo: businessEvent.orderNo });
+        throw err;
+      }
       const dupRecords = await this.model.findAll({ where: fallbackWhere });
       if (dupRecords.length > 0) {
         return { success: true, data: { lines: dupRecords }, idempotent: true };

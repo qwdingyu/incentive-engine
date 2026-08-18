@@ -322,6 +322,30 @@ describe("GenericSettlementService", () => {
       expect(tx.commit).not.toHaveBeenCalled();
     });
 
+    test("UniqueConstraintError 但兜底查询条件为空 → 上抛（防御全表返回）", async () => {
+      const tx = makeMockTransaction();
+      const cfg = makeMinimalConfig({
+        idempotency: {
+          buildPreReadWhere: (e) => ({ order_no: e.orderNo }),
+          buildFallbackWhere: () => ({}), // 空兜底条件（配置错误）
+        },
+      });
+      cfg.model.findAll.mockResolvedValue([]);
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.ruleSetService.getActiveRuleSet.mockResolvedValue({ success: true, data: { config_json: { rewardDefs: [{ rewardId: "commission", type: "DIRECT", target: "PARENT", rate: "10" }] } } });
+      mockBuildPipelineStages.mockReturnValue([{ id: "distribute", handler: "DISTRIBUTE", config: {} }]);
+      mockExecutePipeline.mockReturnValue({
+        results: { distribute: [{ rewardId: "commission", nodeId: "u0", amount: "100" }] },
+        final: [{ rewardId: "commission", nodeId: "u0", amount: "100" }],
+        context: {},
+      });
+      cfg.model.create.mockRejectedValue(new UniqueConstraintError("重复键冲突"));
+      const svc = new GenericSettlementService(cfg);
+      // 空兜底条件 → 不应把全表当成功返回，应上抛
+      await expect(svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" })).rejects.toThrow("重复键冲突");
+      expect(tx.rollback).toHaveBeenCalledTimes(1);
+    });
+
     test("非 UniqueConstraint 异常上抛", async () => {
       const tx = makeMockTransaction();
       const cfg = makeMinimalConfig();
