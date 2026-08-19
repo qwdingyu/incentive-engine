@@ -269,6 +269,13 @@ const { validateCustomerConfig } = require("./customer-config");
  * @property {string} LIMIT - 封顶限额字段名
  */
 const CONFIG_FIELD_KEYS = Object.freeze({
+  // 顶层字段名（config_json 的顶层键，供消费方 diff/遍历引用）
+  REWARD_DEFS: "rewardDefs",
+  RANK_DEFS: "rankDefs",
+  CAP_DEFS: "capDefs",
+  ALLOCATORS: "allocators",
+  PIPELINE_DEF: "pipelineDef",
+  // 子字段名（各 def 内部的键）
   REWARD_ID: "rewardId",
   RANK_ID: "rankId",
   CAP_ID: "capId",
