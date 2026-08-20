@@ -21,6 +21,10 @@
   ],
   "license": "MIT",
   "author": "usethink contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qwdingyu/incentive-engine.git"
+  },
   "homepage": "https://www.npmjs.com/package/@usethink/incentive-engine",
   "dependencies": {
     "decimal.js": "^10.4.3"
