@@ -1,0 +1,104 @@
+# 引擎发布：tag 触发自动发布到 npmjs
+# 参考 @usethink/publish-toolkit 的发布最佳实践（docs/001 §2.3 / §5.4）
+# 触发：推送 v* tag 或手动 workflow_dispatch。
+# 保护：npm 上已存在同版本时跳过发布（允许先手工发布再推 tag 做源码追溯）。
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry-run 模式（只预览，不实际发布）'
+        type: boolean
+        default: false
+      tag:
+        description: 'dist-tag（正式版用 latest，beta 用 beta）'
+        type: string
+        default: latest
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Build & Publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Smoke test
+        run: npm run smoke
+
+      - name: Verify pack
+        run: node scripts/verify-pack.js
+
+      - name: Check published version
+        id: published
+        run: |
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "package_version=${PACKAGE_VERSION}" >> $GITHUB_OUTPUT
+
+          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "ℹ️ ${PACKAGE_NAME}@${PACKAGE_VERSION} 已存在，跳过发布。"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "✅ ${PACKAGE_NAME}@${PACKAGE_VERSION} 尚未发布，可以继续。"
+          fi
+
+      - name: Publish to npm
+        if: steps.published.outputs.exists != 'true'
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "🧪 Dry-run 模式..."
+              npm publish --dry-run --tag=${{ inputs.tag }} --provenance
+            else
+              echo "🚀 手动触发正式发布..."
+              npm publish --tag=${{ inputs.tag }} --provenance
+            fi
+          else
+            echo "🚀 Tag 触发自动发布: ${{ github.ref_name }}"
+            npm publish --tag=latest --provenance
+          fi
+
+      - name: Display publish result
+        if: success()
+        run: |
+          PACKAGE_NAME="${{ steps.published.outputs.package_name }}"
+          PACKAGE_VERSION="${{ steps.published.outputs.package_version }}"
+          if [ "${{ steps.published.outputs.exists }}" = "true" ]; then
+            echo "ℹ️ ${PACKAGE_NAME}@${PACKAGE_VERSION} 已存在，本次跳过发布。"
+          else
+            echo "✅ ${PACKAGE_NAME}@${PACKAGE_VERSION} 发布成功！"
+          fi
+          echo "   查看: https://www.npmjs.com/package/${PACKAGE_NAME}"
