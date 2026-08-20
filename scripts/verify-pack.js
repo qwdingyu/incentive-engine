@@ -7,11 +7,14 @@ const { execFileSync } = require("child_process");
 
 // 必备文件清单（相对 tarball 根）；npm 会自动包含 LICENSE/README/package.json/main，
 // 此处显式断言以兜底未来误改 files 白名单。
-const REQUIRED_FILES = ["LICENSE", "README.md", "package.json", "src/index.js"];
+const REQUIRED_FILES = ["LICENSE", "README.md", "CHANGELOG.md", "package.json", "src/index.js", "src/index.d.ts"];
+
+// 禁止进入 tarball 的目录前缀：内部审查报告、评估文档、Demo 与测试不应随包分发。
+const FORBIDDEN_PREFIXES = ["docs/", "demo/", "tests/", "scripts/"];
 
 /**
- * 运行 npm pack --dry-run --json 并断言必备文件齐全。
- * 返回解析出的 tarball 文件名与文件总数，任何缺失即抛错。
+ * 运行 npm pack --dry-run --json 并断言必备文件齐全、禁发目录未混入。
+ * 返回解析出的 tarball 文件名与文件总数，任何缺失/越界即抛错。
  */
 function verifyPack() {
   let stdout;
@@ -34,6 +37,15 @@ function verifyPack() {
   const missing = REQUIRED_FILES.filter((p) => !paths.includes(p));
   if (missing.length > 0) {
     throw new Error("tarball 缺失必备文件：" + missing.join(", ") + "，请检查 files 白名单");
+  }
+
+  const leaked = paths.filter((p) => FORBIDDEN_PREFIXES.some((prefix) => p.startsWith(prefix)));
+  if (leaked.length > 0) {
+    throw new Error(
+      "tarball 混入了禁发路径（" + FORBIDDEN_PREFIXES.join(", ") + "）：" +
+      leaked.slice(0, 10).join(", ") + (leaked.length > 10 ? ` 等 ${leaked.length} 项` : "") +
+      "，请收敛 files 白名单"
+    );
   }
   return { filename: meta.filename, total: meta.files.length };
 }

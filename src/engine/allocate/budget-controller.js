@@ -2,17 +2,149 @@
  * 封顶控制器 — 通用纯计算，无外部依赖
  *
  * 领域无关的多维封顶裁剪：capDefs 数组驱动，每个 capDef 声明
- * scope（PLATFORM_DAILY 平台日封顶 / PER_USER_DAILY 单用户日封顶）与 limit（上限），
- * 引擎遍历 capDefs 逐维裁剪。任意客户通过配置声明自己的封顶维度。
- * 具体业务的封顶维度（平台日封顶、单用户日封顶等）由上层以 capDefs 声明，
- * 引擎不内置任何业务口径。
+ * scope（`<维度>_<周期>`，维度 PLATFORM/PER_USER × 周期 DAILY/WEEKLY/MONTHLY/TOTAL）
+ * 与 limit（上限），引擎遍历 capDefs 逐维裁剪，最终金额 = min(原金额, 各维剩余额度)。
+ * 任意客户通过配置声明自己的封顶维度，引擎不内置任何业务口径。
+ *
+ * ⚠️ 引擎**不认识日期**（见 CAP_PERIODS 注释）：周期边界由宿主的水位行生命周期决定，
+ * 引擎只负责「各周期分桶独立记账 + 逐维取最严裁剪 + 把推进后的水位交回宿主」。
  *
  * v2.2.0 新增：applyBudgetGuard — 总预算兜底保护，防止配错比例导致超发。
+ * v2.3.0 新增：applyCaps / applyBudgetGuard 拒绝冲正（负金额）记录 —— 冲正记录流经
+ * 封顶阶段会反向推进水位、释放当日已用额度，导致后续发放超发（见 _assertNoReversal）。
+ * v2.4.0 新增：WEEKLY / MONTHLY / TOTAL 三个封顶周期（8 个 scope 全组合），
+ * 水位 state 扩展出 `periods[PERIOD]` 分桶（DAILY 仍复用顶层字段，向后兼容）。
  *
- * @version 2.2.0
+ * @version 2.4.0
  */
 
 const Decimal = require("../../decimal");
+
+/**
+ * 防线：封顶/预算阶段拒绝冲正（负金额）记录
+ *
+ * 冲正记录（`Reverse.reverseRecords` 产出，`amount` 为负、`direction："REVERSAL"`）
+ * 一旦流入 applyCaps，负金额会被累加进水位 state —— 平台/单用户当日已发额度被"退还"，
+ * 后续发放据此重新获得额度，最终当日实际发放超过 limit（超发）。
+ * 同理 applyBudgetGuard 的总额会被负金额拉低，掩盖真实超发。
+ *
+ * 因此冲正记录**不应流经 CAP/OVER 阶段**；这里当场抛错而非静默放行。
+ * （封顶水位是否随冲正回退是宿主的业务决策：默认不回退最安全 —— 回退会释放当日预算，
+ *  给"下单发佣→退款→再下单"的套利留出空间。需要回退的宿主应自行在 saveCapState 里处理。）
+ *
+ * @param {string} fnName - 调用方函数名（错误信息定位用）
+ * @param {Array<Object>} records - 待检查记录
+ * @throws {Error} 存在负金额或 direction="REVERSAL" 的记录
+ */
+function _assertNoReversal(fnName, records) {
+  for (const r of records) {
+    if (!r || typeof r !== "object") continue;
+    const isReversal = r.direction === "REVERSAL";
+    const isNegative = r.amount !== undefined && r.amount !== null && Decimal.lt(r.amount, "0");
+    if (isReversal || isNegative) {
+      throw new Error(
+        `${fnName}：不接受冲正/负金额记录（nodeId=${r.nodeId ?? r.memberId ?? "?"}, amount=${r.amount}）—— ` +
+        "负金额会反向推进封顶水位、释放当日已用额度并导致后续发放超发。" +
+        "冲正记录（Reverse.reverseRecords 产出）不应流经 CAP / OVER 阶段。"
+      );
+    }
+  }
+}
+
+/** 封顶维度：PLATFORM = 平台总量（当期所有受益人合计）；PER_USER = 单个受益节点。 */
+const CAP_DIMENSIONS = ["PLATFORM", "PER_USER"];
+
+/**
+ * 封顶周期：DAILY / WEEKLY / MONTHLY / TOTAL
+ *
+ * ⚠️ **引擎不认识日期**：它既不知道"今天"，也不会自己算周一或月初。
+ * 周期语义完全由宿主的水位行生命周期决定 —— `PLATFORM_DAILY` 之所以是"日"封顶，
+ * 是因为宿主的水位表按业务日期分行、跨天自然从 0 起算。因此：
+ * - `WEEKLY` / `MONTHLY`：宿主按 `biz_week` / `biz_month` 分行存水位；
+ * - `TOTAL`：不按自然周期归零的累计（**活动总量** / 生命周期总量）——
+ *   宿主按活动号分行存水位，活动结束即弃用该行。这就是"活动总量封顶"
+ *   （CAMPAIGN_TOTAL）的领域无关表达：引擎不认识"活动"，只认识"这条水位一直不归零"。
+ *
+ * 引擎负责的是：各周期水位**分桶独立记账**、逐维取最严裁剪、把推进后的水位交回宿主。
+ * 所以非 DAILY 封顶**必须**成对配置 `loadCapState` / `saveCapState`（否则每次结算都从 0
+ * 起算，月封顶实际退化成单事件封顶 —— 给出虚假的额度保证，比不配更危险）；
+ * `GenericSettlementService` 在构造期就拦下这种配置。
+ */
+const CAP_PERIODS = ["DAILY", "WEEKLY", "MONTHLY", "TOTAL"];
+
+/** 合法封顶 scope = `<维度>_<周期>` 全组合（8 个）。 */
+const CAP_SCOPES = CAP_DIMENSIONS.flatMap((d) => CAP_PERIODS.map((p) => `${d}_${p}`));
+
+/**
+ * 拆分 scope 为维度与周期（`PER_USER_MONTHLY` → PER_USER + MONTHLY）
+ * @param {string} scope - 合法 scope（调用前已校验）
+ * @returns {{dimension: string, period: string}}
+ */
+function _splitScope(scope) {
+  const i = scope.lastIndexOf("_");
+  return { dimension: scope.slice(0, i), period: scope.slice(i + 1) };
+}
+
+/**
+ * 取某周期的水位桶（唯一真源，按需建桶）
+ *
+ * DAILY 复用 state 顶层的 `platformPaid` / `memberPaid`（3.4.x 起的既有形状，向后兼容），
+ * 其余周期放在 `state.periods[PERIOD]`。DAILY **不**在 periods 里再存一份 ——
+ * 同一个数存两处，宿主只持久化其中一处时会静默半失效（水位偏低 = 超发方向）。
+ *
+ * @param {Object} state - 封顶水位状态（会被就地写入）
+ * @param {string} period - CAP_PERIODS 之一
+ * @returns {Object} { platformPaid, memberPaid }
+ */
+function _getPeriodBucket(state, period) {
+  if (period === "DAILY") return state;
+  if (!state.periods || typeof state.periods !== "object") state.periods = {};
+  if (!state.periods[period]) state.periods[period] = { platformPaid: "0", memberPaid: new Map() };
+  return state.periods[period];
+}
+
+/**
+ * 取桶内 memberPaid Map（用于推进水位；缺失时按需创建）
+ * @param {Object} bucket - 水位桶
+ * @param {string} period - 周期（错误信息定位用）
+ * @returns {Map} memberPaid
+ * @throws {Error} memberPaid 存在但不是 Map
+ */
+function _memberMap(bucket, period) {
+  const m = bucket.memberPaid;
+  if (m instanceof Map) return m;
+  if (m === undefined || m === null) {
+    bucket.memberPaid = new Map();
+    return bucket.memberPaid;
+  }
+  throw new Error(
+    `applyCaps：${period} 周期的 memberPaid 必须是 Map（收到 ${typeof m}）—— ` +
+    "loadCapState 从库里还原时请用 new Map(Object.entries(json))；" +
+    "普通对象会让 .get 取不到值、单用户封顶按 0 重新开闸（超发方向）。"
+  );
+}
+
+/**
+ * 读取单用户已发额度（用于 PER_USER 维度裁剪）
+ *
+ * 配了 PER_USER 封顶却拿不到 memberPaid Map 时**抛错**而非按 0 起算 ——
+ * 按 0 起算等于额度重新开闸，方向上是超发。
+ *
+ * @param {Object} bucket - 水位桶
+ * @param {string} period - 周期（错误信息定位用）
+ * @param {string|number} nodeId - 受益节点
+ * @returns {string} 已发额度（decimal string）
+ */
+function _memberPaidOf(bucket, period, nodeId) {
+  if (!(bucket.memberPaid instanceof Map)) {
+    throw new Error(
+      `applyCaps：配置了 PER_USER_${period} 封顶，但水位 state 里缺少可用的 memberPaid Map ` +
+      `（收到 ${bucket.memberPaid === undefined ? "undefined" : typeof bucket.memberPaid}）—— ` +
+      "请在 loadCapState 里还原成 Map；缺失时按 0 起算会让单用户封顶失效并超发。"
+    );
+  }
+  return bucket.memberPaid.get(nodeId) || "0";
+}
 
 /**
  * 按封顶定义列表裁剪候选收益记录（通用纯计算）
@@ -22,24 +154,34 @@ const Decimal = require("../../decimal");
  *
  * @param {Array<Object>} records - 候选收益记录（含 nodeId/memberId、amount、snapshot?）
  * @param {Array<Object>} capDefs - 封顶定义
- *        [{ capId, scope: "PLATFORM_DAILY"|"PER_USER_DAILY", limit, onExceed? }]
- *        limit 为 decimal string；0 表示不限制；onExceed 一期仅支持 REJECT（丢弃超出）
- * @param {Object} state - 封顶水位状态（platformPaid + memberPaid Map）
+ *        [{ capId, scope, limit, onExceed? }]
+ *        scope：`<维度>_<周期>`，维度 PLATFORM/PER_USER × 周期 DAILY/WEEKLY/MONTHLY/TOTAL
+ *        （8 个合法值，见 CAP_SCOPES）。未知 scope 抛错（防止配错被当作「无此维度」静默放行而超发）。
+ *        limit 为 decimal string；0 表示不限制。
+ *        onExceed："REJECT"（缺省，裁剪超出部分）| "ALERT_ONLY"（不裁剪，仅在 snapshot 标记 alertOnly）。
+ *        同一 scope 配置多条时取最严（limit 最小）的一条。
+ * @param {Object} state - 封顶水位状态：
+ *        `{ platformPaid, memberPaid: Map }` 为 **DAILY** 桶（历史形状，向后兼容）；
+ *        其余周期在 `state.periods[PERIOD] = { platformPaid, memberPaid: Map }`（按需建桶）。
+ *        ⚠️ 非 DAILY 周期若不由宿主持久化并回传，每次调用都从 0 起算 = 该封顶实际不生效。
  * @returns {Array<Object>} 裁剪后的收益记录（附加 snapshot.payoutCaps 快照）
+ * @throws {Error} 未知 scope / 存在冲正（负金额）记录 / 配了 PER_USER 封顶但水位缺 memberPaid Map
  */
 function applyCaps(records, capDefs = [], state = { platformPaid: "0", memberPaid: new Map() }) {
   const cappedRecords = [];
 
+  // 资金安全：冲正（负金额）记录不得进入封顶阶段（否则反向推进水位 → 后续超发）。
+  _assertNoReversal("applyCaps", records);
+
   // 资金安全（P1-1）：解析封顶定义前先校验 scope 合法性。
-  // 未知 scope 必须抛错而非静默放行 —— 否则配置写错 scope（如 PER_USER_MONTHLY）
+  // 未知 scope 必须抛错而非静默放行 —— 否则配置写错 scope（如 PER_USER_MONTHLI）
   // 会被当作「无此维度封顶」而完全不裁剪，直接超发。
   // 注意：capDefSchema 的 scope 枚举已在校验期拦截，但 applyCaps 是纯计算路径，
   // 可能绕过 Validation 直接调用，因此运行时也必须防御。
-  const VALID_SCOPES = new Set(["PLATFORM_DAILY", "PER_USER_DAILY"]);
   for (const c of capDefs) {
-    if (!VALID_SCOPES.has(c.scope)) {
+    if (!CAP_SCOPES.includes(c.scope)) {
       throw new Error(
-        `applyCaps：未知封顶 scope "${c.scope}"（支持: PLATFORM_DAILY, PER_USER_DAILY）`
+        `applyCaps：未知封顶 scope "${c.scope}"（支持: ${CAP_SCOPES.join(", ")}）`
       );
     }
   }
@@ -48,56 +190,59 @@ function applyCaps(records, capDefs = [], state = { platformPaid: "0", memberPai
   // 资金安全（P1-1）：同 scope 多条时取【最严】（limit 最小）而非第一条 ——
   // 否则更严的第二条会被静默忽略（如 limit:1000 在前、limit:100 在后，实际按 1000 封顶）。
   // 取最严是 fail-safe 方向：宁可少发，不可超发。
-  const platformCaps = capDefs.filter((c) => c.scope === "PLATFORM_DAILY" && Decimal.gt(c.limit, "0"));
-  const memberCaps = capDefs.filter((c) => c.scope === "PER_USER_DAILY" && Decimal.gt(c.limit, "0"));
-  const platformCap = platformCaps.length
-    ? platformCaps.reduce((a, b) => (Decimal.lte(a.limit, b.limit) ? a : b))
-    : null;
-  const memberCap = memberCaps.length
-    ? memberCaps.reduce((a, b) => (Decimal.lte(a.limit, b.limit) ? a : b))
-    : null;
-  const dailyPlatformPayoutCap = platformCap ? String(platformCap.limit) : "0";
-  const memberDailyYieldCap = memberCap ? String(memberCap.limit) : "0";
-  // onExceed 语义：REJECT（默认）= 超出丢弃；ALERT_ONLY = 超出不裁剪、保留原金额，仅记录告警标记。
-  // 此前 applyCaps 完全不读取 onExceed，ALERT_ONLY 配置被静默当作 REJECT 处理（资金行为错误）。
-  const platformOnExceed = platformCap?.onExceed || "REJECT";
-  const memberOnExceed = memberCap?.onExceed || "REJECT";
+  // 遍历顺序固定为 CAP_SCOPES（平台各周期 → 单用户各周期），保证 boundBy 与 ALERT_ONLY
+  // 的判定可复现；最终金额与顺序无关（恒等于 min(原金额, 各维剩余额度)）。
+  const effective = [];
+  for (const scope of CAP_SCOPES) {
+    const matched = capDefs.filter((c) => c.scope === scope && Decimal.gt(c.limit, "0"));
+    if (!matched.length) continue;
+    const strictest = matched.reduce((a, b) => (Decimal.lte(a.limit, b.limit) ? a : b));
+    effective.push({
+      scope,
+      ..._splitScope(scope),
+      limit: String(strictest.limit),
+      // onExceed 语义：REJECT（默认）= 超出裁剪；ALERT_ONLY = 超出不裁剪、保留原金额，仅记录告警标记。
+      onExceed: strictest.onExceed || "REJECT",
+    });
+  }
+
+  // 参与水位记账的周期：DAILY 始终参与（向后兼容 —— 既有行为是无论是否配置封顶都推进日水位）；
+  // 其余周期仅在本次配置了该周期封顶时才建桶推进，避免给宿主 saveCapState 塞进它没准备存的桶。
+  const accountedPeriods = [
+    "DAILY",
+    ...CAP_PERIODS.filter((p) => p !== "DAILY" && effective.some((e) => e.period === p)),
+  ];
+
+  // legacy 快照字段：保持既有对账口径不变（老宿主仍读这两个字段）。
+  const dailyPlatformPayoutCap = effective.find((e) => e.scope === "PLATFORM_DAILY")?.limit ?? "0";
+  const memberDailyYieldCap = effective.find((e) => e.scope === "PER_USER_DAILY")?.limit ?? "0";
+  // 全部生效封顶的 limit 表（多周期对账用）。
+  const limits = {};
+  for (const e of effective) limits[e.scope] = e.limit;
 
   for (const record of records) {
+    const nodeId = record.nodeId ?? record.memberId;
     let allowedAmount = record.amount;
-    let alertOnly = false;
+    let boundBy = null;
+    const alertOnlyScopes = [];
 
-    // 平台日封顶先裁剪：平台水位代表当天所有接收人的累计发放额。
-    if (Decimal.gt(dailyPlatformPayoutCap, "0")) {
-      const platformRemaining = Decimal.sub(dailyPlatformPayoutCap, state.platformPaid || "0");
-      // 资金安全（P1-1）：恰好用尽剩余额度（allowedAmount == platformRemaining）不算超发，
+    for (const cap of effective) {
+      const bucket = _getPeriodBucket(state, cap.period);
+      const paid = cap.dimension === "PLATFORM"
+        ? (bucket.platformPaid || "0")
+        : _memberPaidOf(bucket, cap.period, nodeId);
+      const remaining = Decimal.sub(cap.limit, paid);
+      // 资金安全（P1-1）：恰好用尽剩余额度（allowedAmount == remaining）不算超发，
       // 应正常发放而非标记 ALERT_ONLY。故用 lte（<=）而非 lt（<）判断「未超限」。
-      if (Decimal.lte(allowedAmount, platformRemaining)) {
-        // 未超限，正常
-      } else if (platformOnExceed === "ALERT_ONLY") {
+      if (Decimal.lte(allowedAmount, remaining)) continue;
+      if (cap.onExceed === "ALERT_ONLY") {
         // ALERT_ONLY：超限不裁剪，保留原金额，标记告警
-        alertOnly = true;
-      } else {
-        // REJECT（默认）：裁剪到剩余额度
-        allowedAmount = Decimal.min(allowedAmount, platformRemaining);
+        alertOnlyScopes.push(cap.scope);
+        continue;
       }
-    }
-
-    // 单用户日封顶再裁剪：同一节点可同时拿多类收益，必须合并计算当天额度。
-    if (Decimal.gt(memberDailyYieldCap, "0")) {
-      const nodeId = record.nodeId ?? record.memberId;
-      const memberPaid = state.memberPaid.get(nodeId) || "0";
-      const memberRemaining = Decimal.sub(memberDailyYieldCap, memberPaid);
-      // 同上：恰好用尽额度不算超发（lte 而非 lt）。
-      if (Decimal.lte(allowedAmount, memberRemaining)) {
-        // 未超限，正常
-      } else if (memberOnExceed === "ALERT_ONLY") {
-        // ALERT_ONLY：超限不裁剪，保留原金额，标记告警
-        alertOnly = true;
-      } else {
-        // REJECT（默认）：裁剪到剩余额度
-        allowedAmount = Decimal.min(allowedAmount, memberRemaining);
-      }
+      // REJECT（默认）：裁剪到剩余额度。只会变小，因此最后一次裁剪它的 scope 即最严的一维。
+      allowedAmount = Decimal.min(allowedAmount, remaining);
+      boundBy = cap.scope;
     }
 
     // 没有剩余额度的记录直接丢弃，不写 0 金额收益，避免对账报表出现无意义流水。
@@ -112,17 +257,24 @@ function applyCaps(records, capDefs = [], state = { platformPaid: "0", memberPai
         memberDailyYieldCap,
         originalAmount: record.amount,
         cappedAmount: allowedAmount,
+        ...(effective.length ? { limits } : {}),
+        // 实际决定本条金额的那一维（多周期并存时的对账关键）
+        ...(boundBy ? { boundBy } : {}),
         // ALERT_ONLY 超发告警标记：运营可据此识别"超发但保留"的记录
-        ...(alertOnly ? { alertOnly: true, onExceed: "ALERT_ONLY" } : {}),
+        ...(alertOnlyScopes.length
+          ? { alertOnly: true, onExceed: "ALERT_ONLY", alertOnlyScopes }
+          : {}),
       },
     };
     cappedRecords.push(cappedRecord);
 
     // 裁剪后立即推进水位，保证同一批次内后续记录看到最新已发额度。
-    state.platformPaid = Decimal.add(state.platformPaid || "0", allowedAmount);
-    const nodeId = record.nodeId ?? record.memberId;
-    const currentMemberPaid = state.memberPaid.get(nodeId) || "0";
-    state.memberPaid.set(nodeId, Decimal.add(currentMemberPaid, allowedAmount));
+    for (const period of accountedPeriods) {
+      const bucket = _getPeriodBucket(state, period);
+      bucket.platformPaid = Decimal.add(bucket.platformPaid || "0", allowedAmount);
+      const memberPaid = _memberMap(bucket, period);
+      memberPaid.set(nodeId, Decimal.add(memberPaid.get(nodeId) || "0", allowedAmount));
+    }
   }
 
   return cappedRecords;
@@ -150,6 +302,8 @@ function applyCaps(records, capDefs = [], state = { platformPaid: "0", memberPai
  */
 function applyBudgetGuard(records, config, context = {}) {
   if (!records || records.length === 0) return records;
+  // 资金安全：冲正（负金额）记录会把总额拉低，掩盖真实超发 —— 先拒绝再判断配置。
+  _assertNoReversal("applyBudgetGuard", records);
   if (!config || !config.totalBudget || !config.eventValue) return records;
 
   const totalBudget = String(config.totalBudget);
@@ -252,4 +406,4 @@ function applyBudgetGuard(records, config, context = {}) {
   );
 }
 
-module.exports = { applyCaps, applyBudgetGuard };
+module.exports = { applyCaps, applyBudgetGuard, CAP_SCOPES, CAP_DIMENSIONS, CAP_PERIODS };

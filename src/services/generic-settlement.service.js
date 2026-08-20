@@ -26,18 +26,32 @@
  * - batchSettle()          : 批量结算，同一事务原子提交
  * - list() / getByWhere()  : 查询能力（getByWhere 拒绝空条件，防止返回任意行）
  *
- * @version 3.0.0
+ * ⚠️ 跨结算周期封顶（scope 以 _WEEKLY / _MONTHLY / _TOTAL 结尾）必须成对配置
+ *    loadCapState / saveCapState，否则 _calculate 直接返回 { ok:false }（见 §4.1 注释）。
+ *
+ * ⚠️ 规则集带时间维度（`effective` 生效期 / `campaignDefs` 活动加成）时，事件必须能取到
+ *    **发生时刻**（`buildOccurredAt` 钩子，缺省读 `businessEvent.occurredAt`）。
+ *    取不到时 _calculate 返回 { ok:false }：引擎绝不用「当前时间」兜底 —— 结算重试、
+ *    补跑昨天的单、对账重算都在窗口之外执行，那会给历史订单套上今天的活动系数（见 §4.0）。
+ *
+ * @version 3.3.0
  */
 
 const engine = require("../engine");
 const { buildPipelineStages } = require("../adapters");
-const { normalizePagination } = require("../utils");
+const { normalizePagination, isWithinWindow } = require("../utils");
 
 /** 唯一约束错误类（懒加载），sequelize 为可选 peer */
 let _UniqueConstraintError = null;
 
 /** 必填配置项 */
 const REQUIRED_CONFIG_KEYS = ["name", "ruleSetCode", "model", "buildEvent", "buildRecord", "idempotency"];
+
+/**
+ * 冲正块（config.reversal）的必填子项。
+ * 配了 reversal 却缺子项 → 构造期抛错（fail-fast），绝不留到退款回调那一刻才发现。
+ */
+const REQUIRED_REVERSAL_KEYS = ["loadOriginalRecords", "buildOriginalRecord", "resolveReversal", "buildRecord", "idempotency"];
 
 /**
  * 通用结算服务类
@@ -49,6 +63,18 @@ const REQUIRED_CONFIG_KEYS = ["name", "ruleSetCode", "model", "buildEvent", "bui
  * @param {Function} config.buildEvent - (event) => EngineEvent { sourceNodeId, eventType, eventValue }
  * @param {Function} [config.buildDirectParent] - (event) => { id, rankRate } | null
  * @param {Function} [config.buildAncestors] - (event) => Array<{ id, rankRate }>
+ * @param {Function} [config.buildSourceNode] - (event) => { id, attrs? } | null
+ *   事件来源节点对象构造钩子（可选）。仅当规则集里存在 target:"SOURCE" 且
+ *   conditions 含受益节点侧条件（source:"target"）的奖励时必需 —— 引擎需要节点对象
+ *   才能对「本人」求值，缺失会抛错（绝不静默按事件求值，那会把门槛悄悄放行）。
+ *   缺省返回 null，与 3.4.x 行为一致。
+ * @param {Function} [config.buildOccurredAt] - (event) => Date | string | null
+ *   事件**发生时刻**构造钩子（可选）。缺省读 `businessEvent.occurredAt`。
+ *   仅当规则集带时间维度（`effective` 生效期 / `campaignDefs` 活动加成）时必需。
+ *   只接受 Date 实例或**带时区偏移**的 ISO-8601 字符串（`"2026-11-11T00:00:00+08:00"`）；
+ *   不带偏移的字面量会按进程本地时区解析，同一配置在不同环境相差数小时。
+ *   ⚠️ 必须是**事件真实发生时刻**（下单/支付时间），不是结算执行时刻 ——
+ *   否则补跑历史单会套上今天的活动系数（超发）或错过当时的活动（少发）。
  * @param {Function} config.buildRecord - (businessEvent, engineRecord, extra) => Object | null
  * @param {Object} config.idempotency - 幂等配置
  * @param {Function} config.idempotency.buildPreReadWhere - (event) => where object
@@ -59,6 +85,10 @@ const REQUIRED_CONFIG_KEYS = ["name", "ruleSetCode", "model", "buildEvent", "bui
  *   结算前读取当前已发放水位，供 CAP 阶段跨事件累计封顶。
  *   返回 null/undefined 时引擎自建初始水位（与不配置时行为一致，封顶仅限单事件内）。
  *   配置后与 saveCapState 成对使用，才能实现「跨事件平台日封顶」（P0-1 资金安全修复）。
+ *   ⚠️ 规则集里存在非 DAILY 周期封顶（`_WEEKLY`/`_MONTHLY`/`_TOTAL`）时**必须**成对配置
+ *   本钩子与 saveCapState，否则结算直接返回 `{ success:false }` —— 水位每次从 0 起算的
+ *   「月封顶」会退化成「单事件封顶」，跑 100 笔就发 100 倍（虚假额度保证比不配更危险）。
+ *   宿主需连同 `capState.periods` 一起持久化/还原（memberPaid 必须还原成 Map）。
  * @param {Function} [config.saveCapState] - (capState, transaction) => Promise<void>
  *   平台/单用户日封顶水位持久化钩子（可选）。
  *   在结算事务内、落账之后调用；与记录共享同一事务，任一步失败即整体回滚，
@@ -66,6 +96,27 @@ const REQUIRED_CONFIG_KEYS = ["name", "ruleSetCode", "model", "buildEvent", "bui
  * @param {Object} config.sequelize - Sequelize 实例（必需）
  * @param {Object} config.ruleSetService - 规则集服务（必需，需有 getActiveRuleSet 方法）
  * @param {Object} [config.logger] - 日志对象（可选，缺省使用 console）
+ * @param {Object} [config.reversal] - 冲正（退款/撤单追回）配置块（可选）。
+ *   不配置时 reverse() 返回 { success: false }，settle 路径完全不受影响。
+ * @param {Function} config.reversal.loadOriginalRecords - (businessEvent, { transaction, options }) => Promise<Array<row>>
+ *   还原本次冲正对应的**原始发放记录**（宿主查自己的收益表，通常按原订单号）。
+ *   在冲正事务内调用 —— 宿主可在此加行锁（如 { lock: transaction.LOCK.UPDATE }）防并发超额追回。
+ * @param {Function} config.reversal.buildOriginalRecord - (row, businessEvent) => { recordId, nodeId, amount, rewardId?, rewardType? } | null
+ *   把宿主表行映射成引擎口径的原始记录；返回 null 的行被跳过。
+ *   recordId 必须是落库主键（引擎用它做「已冲正累计」查找键与对账主键）。
+ * @param {Function} config.reversal.resolveReversal - (businessEvent) => { ratio } | { reversalValue, originalEventValue }
+ *   本次冲正比例（可另带 onExceed / reasonCode）。**没有缺省值**：引擎绝不默认全额冲正。
+ * @param {Function} config.reversal.buildRecord - (businessEvent, reversalRecord, extra) => Object | null
+ *   引擎冲正记录 → 落账行。reversalRecord.amount 为**负数**，reversedAmount 为正数绝对值。
+ * @param {Object} config.reversal.idempotency - 冲正专属幂等配置（与发放侧独立）：
+ *   { buildPreReadWhere, buildFallbackWhere } —— 通常按「退款单号」而非原订单号，
+ *   否则同一订单的第二次部分退款会被误判为幂等命中而静默不追回。
+ * @param {Function} [config.reversal.loadReversedMap] - (businessEvent, { transaction }) => Promise<Map|Object|null>
+ *   recordId → 已冲正累计金额（正数）。**多次部分退款场景必配**：不配时引擎视为全部未冲正，
+ *   两次 30% 退款会各按原额 30% 追回（累计可能超过原始发放额）。
+ * @param {Function} [config.reversal.postProcess] - (businessEvent, createdRecords, transaction) => Promise<void>
+ *   冲正专属后处理钩子（事务内）。**不复用发放侧 postProcess** —— 那会把冲正行当作新增发放
+ *   计入宿主的累计/等级/业绩统计，方向上是重复计数。
  * @param {boolean} [config.useBulkCreate=false] - 是否用 model.bulkCreate 批量插入收益记录（可选）。
  *   缺省 false（逐条 model.create，与历史行为一致）。多条记录场景置 true 可把 N 次
  *   DB round-trip 压成 1 次；代价是返回实例的主键回填依赖数据库方言，
@@ -84,6 +135,12 @@ class GenericSettlementService {
     this.buildEvent = config.buildEvent;
     this.buildDirectParent = config.buildDirectParent || (() => null);
     this.buildAncestors = config.buildAncestors || (() => []);
+    // 事件来源节点对象：仅 target:"SOURCE" + 受益节点侧条件时需要，缺省 null。
+    this.buildSourceNode = config.buildSourceNode || (() => null);
+    // 事件发生时刻：规则集生效期与活动加成的判定基准。缺省读事件的 occurredAt 字段
+    // （宿主可用 buildOccurredAt 指向自己的字段名，如 paid_at / created_at）。
+    // 绝不缺省成 new Date()：结算重试/补跑会把「现在」当成事件时刻，直接算错活动窗口。
+    this.buildOccurredAt = config.buildOccurredAt || ((event) => (event && event.occurredAt) || null);
     this.buildRecord = config.buildRecord;
     this.idempotency = config.idempotency;
     this.postProcess = config.postProcess || null;
@@ -98,6 +155,19 @@ class GenericSettlementService {
     // （部分方言/配置下 id 不回填），而返回值会经 data.lines 与 postProcess 暴露给宿主 ——
     // 静默改变既有接入方拿到的实例内容属于破坏性变更，必须由宿主确认后显式开启。
     this.useBulkCreate = config.useBulkCreate === true;
+
+    // 冲正块（可选）：配了就必须完整 —— 缺子项在构造期抛错，不留到退款回调时才炸。
+    this.reversal = config.reversal || null;
+    if (this.reversal) {
+      const missingRev = REQUIRED_REVERSAL_KEYS.filter((k) => !this.reversal[k]);
+      if (missingRev.length) {
+        throw new Error(`GenericSettlement reversal 配置缺少必填项: ${missingRev.join(", ")}`);
+      }
+      const revIdem = this.reversal.idempotency;
+      if (typeof revIdem.buildPreReadWhere !== "function" || typeof revIdem.buildFallbackWhere !== "function") {
+        throw new Error("GenericSettlement reversal.idempotency 必须提供 buildPreReadWhere 与 buildFallbackWhere 函数");
+      }
+    }
 
     // 引擎依赖注入
     if (!config.sequelize) throw new Error("GenericSettlement 配置缺少必填项: sequelize");
@@ -121,14 +191,15 @@ class GenericSettlementService {
    * 目的：防止空键误判幂等（findOne 空条件会返回任意行）、settle(undefined) 的裸 TypeError。
    *
    * @param {Object} businessEvent - 业务事件
+   * @param {Object} [idempotency=this.idempotency] - 幂等配置（冲正路径传 reversal.idempotency）
    * @returns {Object} { ok, message? } 校验结果
    */
-  _validateEvent(businessEvent) {
+  _validateEvent(businessEvent, idempotency = this.idempotency) {
     if (!businessEvent || typeof businessEvent !== "object" || Array.isArray(businessEvent)) {
       return { ok: false, message: "业务事件必须是非空对象" };
     }
     // 从幂等键预读条件推导必填字段：where 中的值若为 空/undefined/null 则视为缺失。
-    const preReadWhere = this.idempotency.buildPreReadWhere(businessEvent);
+    const preReadWhere = idempotency.buildPreReadWhere(businessEvent);
     if (!preReadWhere || typeof preReadWhere !== "object") {
       return { ok: false, message: "幂等键预读条件必须返回非空对象" };
     }
@@ -420,6 +491,8 @@ class GenericSettlementService {
     // 3. 构建直接上级和祖先链
     const directParent = this.buildDirectParent(businessEvent);
     const ancestors = this.buildAncestors(businessEvent);
+    // 事件来源节点对象（可选钩子）：供 target:"SOURCE" 的受益节点侧条件求值。
+    const sourceNode = this.buildSourceNode(businessEvent);
 
     // 4. 组装流水线：规则集引擎配置存储在 config_json 中
     //    兼容两种数据格式：
@@ -430,11 +503,77 @@ class GenericSettlementService {
       ...(raw.config_json || raw),
       rewardDefs: raw.rewardDefs || raw.config_json?.rewardDefs || [],
       capDefs: raw.capDefs || raw.config_json?.capDefs || [],
+      campaignDefs: raw.campaignDefs || raw.config_json?.campaignDefs || [],
+      effective: raw.effective || raw.config_json?.effective || null,
     };
+
+    // 4.0 时间维度（fail-closed）：规则集生效期 + 活动期加成都以「事件发生时刻」为基准。
+    //     引擎不认识日期、也绝不调用 Date.now() —— 结算重试、补跑昨天的单、对账重算
+    //     都在活动窗口之外执行，用「当前时刻」判定等于给历史订单套上今天的系数（超发），
+    //     或让当天的单错过当时的活动（少发）。因此时刻必须由宿主显式提供，取不到即拒绝结算。
+    const needsOccurredAt =
+      !!ruleSetConfig.effective
+      || (Array.isArray(ruleSetConfig.campaignDefs) && ruleSetConfig.campaignDefs.length > 0);
+    let occurredAt = null;
+    if (needsOccurredAt) {
+      occurredAt = this.buildOccurredAt(businessEvent);
+      if (!occurredAt) {
+        return {
+          ok: false,
+          message:
+            `规则集 ${ruleSetCode} 带时间维度（`
+            + [ruleSetConfig.effective && "effective 生效期", ruleSetConfig.campaignDefs.length && "campaignDefs 活动加成"]
+              .filter(Boolean).join(" + ")
+            + "），但取不到事件发生时刻：请在事件上提供 occurredAt，或配置 buildOccurredAt 钩子"
+            + "指向你的时间字段（Date 实例或带偏移量的 ISO-8601，如 \"2026-11-11T00:00:00+08:00\"）。"
+            + "引擎不会用当前时间兜底 —— 结算重试/补跑历史单会因此套错活动系数。",
+        };
+      }
+      // 4.0.1 生效期：事件发生时刻落在 [startAt, endAt) 之外 → 本次不发放（少发方向）。
+      //       过期规则集若静默按原比例继续发，等于「双十一的翻倍规则一直发到十二月」。
+      try {
+        if (ruleSetConfig.effective && !isWithinWindow(ruleSetConfig.effective, occurredAt, `规则集 ${ruleSetCode} 的 effective`)) {
+          return {
+            ok: false,
+            message:
+              `规则集 ${ruleSetCode} 不在生效期内：事件发生时刻 ${new Date(occurredAt).toISOString()} `
+              + `不落在 [${ruleSetConfig.effective.startAt}, ${ruleSetConfig.effective.endAt}) 内（左闭右开），本次不发放。`,
+          };
+        }
+      } catch (e) {
+        // 时刻/窗口非法（如没写时区偏移）→ 拒绝结算而不是当作「不在生效期」或「在生效期」，
+        // 两个方向的静默兜底都会算错钱。
+        return { ok: false, message: `规则集 ${ruleSetCode} 的生效期或事件时刻非法: ${e.message}` };
+      }
+    }
+
+    // 4.1 资金安全（fail-closed）：非 DAILY 周期封顶（WEEKLY/MONTHLY/TOTAL）必须成对配置
+    //     loadCapState / saveCapState。引擎不认识日期 —— 周期语义完全由宿主的水位行
+    //     生命周期决定；没有水位钩子时每次结算都从 0 起算，「月封顶 5 万」实际退化为
+    //     「单事件封顶 5 万」，跑 100 笔就发 500 万。给出虚假的额度保证比不配更危险，
+    //     因此这里拒绝结算（少发方向）而不是静默按单事件裁剪。
+    //     DAILY 维持历史行为（未配钩子也照旧运行），避免破坏既有接入方。
+    const longPeriodScopes = (ruleSetConfig.capDefs || [])
+      .filter((c) => c && typeof c.scope === "string" && !c.scope.endsWith("_DAILY"))
+      .map((c) => c.scope);
+    if (longPeriodScopes.length && !(this.loadCapState && this.saveCapState)) {
+      return {
+        ok: false,
+        message:
+          `封顶 scope ${[...new Set(longPeriodScopes)].join(", ")} 是跨结算周期封顶，` +
+          "必须成对配置 loadCapState / saveCapState 钩子才能生效" +
+          `（当前缺少 ${[!this.loadCapState && "loadCapState", !this.saveCapState && "saveCapState"].filter(Boolean).join(" 与 ")}）` +
+          " —— 否则每次结算水位从 0 起算，周/月/活动总量封顶会退化成单事件封顶并大幅超发。",
+      };
+    }
+
     const stages = buildPipelineStages(ruleSetConfig, {
       event: engineEvent,
+      sourceNode,
       directParent,
       ancestors,
+      // 活动加成的判定基准（见 §4.0）；无时间维度的规则集为 null，CAMPAIGN 阶段不会被装配。
+      occurredAt,
     });
 
     // 5. 引擎执行
@@ -515,9 +654,10 @@ class GenericSettlementService {
    *
    * @param {Error} err - 捕获的异常
    * @param {Object} businessEvent - 业务事件
+   * @param {Object} [idempotency=this.idempotency] - 幂等配置（冲正路径传 reversal.idempotency）
    * @returns {Promise<Object>} { success, data?, idempotent? }（仅幂等路径）
    */
-  async _handleSettleError(err, businessEvent) {
+  async _handleSettleError(err, businessEvent, idempotency = this.idempotency) {
     // 唯一约束兜底判定：优先宿主注入的类（实例级，不模块级缓存，避免跨宿主串味）；
     // 未注入时懒加载 sequelize 的 UniqueConstraintError（可选 peer，模块级缓存）。
     let isUniqueConstraint = false;
@@ -541,7 +681,7 @@ class GenericSettlementService {
     }
 
     if (isUniqueConstraint) {
-      const fallbackWhere = this.idempotency.buildFallbackWhere(businessEvent);
+      const fallbackWhere = idempotency.buildFallbackWhere(businessEvent);
       // 防御：空兜底查询条件会 findAll({ where: {} }) 返回全表，
       // 把无关记录当作幂等成功返回（与 _validateEvent 空 where 同类的数据泄漏边界）。
       if (!fallbackWhere || typeof fallbackWhere !== "object" || Object.keys(fallbackWhere).length === 0) {
@@ -557,6 +697,131 @@ class GenericSettlementService {
       this.log.error(`结算失败: ${err.message}`, { orderNo: businessEvent.orderNo });
     }
     throw err;
+  }
+
+  /**
+   * 冲正（退款/撤单追回）：把本次退款对应的已发放收益按比例反向追回并落账
+   *
+   * 与 settle() 的三处关键差异（均为资金安全考虑）：
+   * 1. **计算在事务内**：冲正金额依赖 DB 现值（原始发放记录 + 已冲正累计），
+   *    必须在事务内读取，宿主可在 loadOriginalRecords 里加行锁 —— 否则并发冲正
+   *    各自看到旧的「已冲正累计」，累计追回可能超过原始发放额（超额扣款）。
+   * 2. **幂等键独立**：用 reversal.idempotency（通常按退款单号），不复用发放侧的订单号 ——
+   *    否则同一订单的第二次部分退款会被误判为幂等命中而静默不追回。
+   * 3. **不动封顶水位**：冲正不回退 capState。回退会把当日已用额度"退还"，
+   *    给「下单发佣 → 退款 → 再下单」留出套利空间（当日实际发放超过 limit）。
+   *    确有回退需求的宿主请自行在 saveCapState 侧处理，并明确接受该风险。
+   *
+   * 找不到可冲正的原始记录（该订单本就未发放佣金）属正常运行期情况：
+   * 返回 { success: true, data: { skipped: true } }，不落账、不报错。
+   *
+   * @param {Object} businessEvent - 业务事件（退款/撤单事件，字段由宿主的钩子解释）
+   * @param {Object} [options] - 可选参数，原样透传给 loadOriginalRecords
+   * @returns {Promise<Object>} { success, data?: { lines, summary, skipped? }, message?, idempotent? }
+   */
+  async reverse(businessEvent, options = {}) {
+    if (!this.reversal) {
+      return { success: false, message: `${this.name} 未配置 reversal 冲正块，reverse() 不可用` };
+    }
+    const revIdem = this.reversal.idempotency;
+
+    // 0. 事件守卫（用冲正专属幂等键推导必填字段）
+    const validation = this._validateEvent(businessEvent, revIdem);
+    if (!validation.ok) {
+      return { success: false, message: validation.message };
+    }
+
+    // 1. 幂等快路径（事务外预读）：同一笔退款重复回调不二次扣款。
+    const preReadWhere = revIdem.buildPreReadWhere(businessEvent);
+    const existing = await this.model.findAll({ where: preReadWhere });
+    if (existing.length > 0) {
+      this.log.info(`冲正幂等命中: ${this.name} 已处理，返回 ${existing.length} 条冲正记录`);
+      return { success: true, data: { lines: existing }, idempotent: true };
+    }
+
+    // 2. 事务内：读原始记录 + 已冲正累计 → 计算 → 落账（见方法头第 1 条）。
+    const t = await this.sequelize.transaction();
+    try {
+      const originalRows = await this.reversal.loadOriginalRecords(businessEvent, { transaction: t, options });
+      if (!Array.isArray(originalRows)) {
+        throw new Error(`${this.name} reversal.loadOriginalRecords 必须返回数组（收到 ${typeof originalRows}）`);
+      }
+      const originalRecords = originalRows
+        .map((row) => this.reversal.buildOriginalRecord(row, businessEvent))
+        .filter(Boolean);
+
+      // 无可冲正记录：正常运行期情况（订单未达发放门槛 / 本就没发过佣金），不落账不报错。
+      if (originalRecords.length === 0) {
+        await t.rollback();
+        this.log.info(`${this.name} 冲正无可追回记录（原始发放记录为空）`);
+        return { success: true, data: { skipped: true, lines: [], summary: null }, idempotent: false };
+      }
+
+      // 已冲正累计（多次部分退款必配；未配时视为全部未冲正，见构造函数 JSDoc 警告）。
+      const reversedMap = this.reversal.loadReversedMap
+        ? await this.reversal.loadReversedMap(businessEvent, { transaction: t })
+        : null;
+
+      const input = this.reversal.resolveReversal(businessEvent) || {};
+      const { records, summary } = engine.Reverse.reverseRecords({
+        originalRecords,
+        ratio: input.ratio,
+        reversalValue: input.reversalValue,
+        originalEventValue: input.originalEventValue,
+        reversedMap: reversedMap ?? null,
+        onExceed: input.onExceed || "CLAMP",
+        reasonCode: input.reasonCode ?? null,
+      });
+
+      const dbRecords = records
+        .map((r, i) => this.reversal.buildRecord(businessEvent, r, { index: i, total: records.length, summary }))
+        .filter(Boolean);
+
+      // 全部已冲正完（幂等）或 buildRecord 全过滤 → 无落账，不占用事务。
+      if (dbRecords.length === 0) {
+        await t.rollback();
+        this.log.info(`${this.name} 冲正无落账记录（已全额冲正或 buildRecord 全部过滤）`);
+        return { success: true, data: { skipped: true, lines: [], summary }, idempotent: false };
+      }
+
+      const writeResult = await this._writeReversalRecords(businessEvent, dbRecords, t);
+      await t.commit();
+      return { success: true, data: { ...writeResult, summary }, idempotent: false };
+    } catch (err) {
+      await t.rollback();
+      // 与 settle 同一错误契约：唯一约束冲突走幂等兜底，其余异常上抛。
+      return this._handleSettleError(err, businessEvent, revIdem);
+    }
+  }
+
+  /**
+   * 冲正记录落账（私有，事务内）
+   *
+   * 与 _writeRecords 的差异：不持久化封顶水位（冲正不回退水位），
+   * 且只调用 reversal.postProcess —— 复用发放侧 postProcess 会把冲正行
+   * 当作新增发放计入宿主的累计/业绩统计（重复计数，方向上是多算）。
+   *
+   * @param {Object} businessEvent - 业务事件
+   * @param {Array<Object>} dbRecords - 待落账的冲正行
+   * @param {import("sequelize").Transaction} transaction - 事务
+   * @returns {Promise<Object>} { lines }
+   */
+  async _writeReversalRecords(businessEvent, dbRecords, transaction) {
+    let createdRecords;
+    if (this.useBulkCreate && typeof this.model.bulkCreate === "function" && dbRecords.length > 0) {
+      createdRecords = await this.model.bulkCreate(dbRecords, { transaction });
+    } else {
+      createdRecords = [];
+      for (const record of dbRecords) {
+        const created = await this.model.create(record, { transaction });
+        createdRecords.push(created);
+      }
+    }
+    if (this.reversal.postProcess) {
+      await this.reversal.postProcess(businessEvent, createdRecords, transaction);
+    }
+    this.log.info(`${this.name} 冲正落账 ${createdRecords.length} 条记录`);
+    return { lines: createdRecords };
   }
 
   /**
@@ -597,4 +862,4 @@ class GenericSettlementService {
   }
 }
 
-module.exports = { GenericSettlementService, REQUIRED_CONFIG_KEYS };
+module.exports = { GenericSettlementService, REQUIRED_CONFIG_KEYS, REQUIRED_REVERSAL_KEYS };

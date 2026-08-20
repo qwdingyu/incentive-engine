@@ -1,8 +1,8 @@
 /**
- * @usethink/incentive-engine — 通用营销激励引擎（v3.3.1）
+ * @usethink/incentive-engine — 通用营销激励引擎
  *
  * 领域无关的纯计算核心，零外部业务依赖。
- * 不查询数据库，不管理事务，不认识任何业务词（直推/极差/佣金/茸贝）。
+ * 不查询数据库，不管理事务，不认识任何业务词（直推/极差/佣金/积分等均由上层翻译）。
  *
  * 业务规则由上层翻译成 rewardDefs/rankDefs/capDefs 配置后交给引擎，
  * 引擎只做"输入 → 计算 → 输出"。
@@ -34,7 +34,7 @@
  * - engine.Utils          — 工具函数（分页/灰度路由/日期函数）
  * - engine.Decimal        — 安全金额计算（decimal.js 包装）
  *
- * @version 3.4.10
+ * @version 4.0.0
  * @license MIT
  */
 

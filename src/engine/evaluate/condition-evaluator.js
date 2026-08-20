@@ -16,10 +16,55 @@
  * // result === true
  * ```
  *
- * @version 1.0.0
+ * 数据源选择（v1.1.0）：COMPARE 条件可声明 `source` 指定对**哪个对象**求值 ——
+ * `"event"`（事件侧，如"订单金额 >= 1000"）或 `"target"`（受益节点侧，如
+ * "上级团队业绩满 5 万才发佣"）。未声明 `source` 时对第 2 参 `data` 求值，
+ * 与 1.0.0 行为完全一致（向后兼容）。声明了 `source` 时从第 3 参 `context`
+ * 取对应数据源（`{ event, target }`），取不到即抛错 —— 静默回落到另一个数据源
+ * 会把"拦住不发"的门槛悄悄变成"放行发放"（超发方向），是资金安全事故。
+ *
+ * @version 1.1.0
  */
 
 const Decimal = require("../../decimal");
+
+/** COMPARE 条件支持的数据源名（context 的键） */
+const CONDITION_SOURCES = Object.freeze(["event", "target"]);
+
+/**
+ * 解析 COMPARE 条件的求值数据源
+ *
+ * - 未声明 `source` → 返回第 2 参 `data`（默认数据源，向后兼容）
+ * - `source: "event" | "target"` → 从 `context` 取对应对象
+ * - 未知 source（拼写错误等）→ **抛错**：静默忽略等于让条件对错误对象求值
+ * - 声明的数据源在 context 中缺失 → **抛错**：绝不回落到另一个数据源
+ *
+ * @private
+ * @param {Object} condition - { field?, source? }
+ * @param {Object} data - 默认数据源（第 2 参）
+ * @param {Object} [context] - 命名数据源 { event?, target? }
+ * @returns {Object} 求值数据源
+ */
+function _resolveDataSource(condition, data, context) {
+  const source = condition.source;
+  if (source === undefined || source === null || source === "") return data;
+  if (!CONDITION_SOURCES.includes(source)) {
+    throw new Error(
+      `条件未知 source: ${JSON.stringify(source)}（field=${condition.field}）` +
+      `：仅支持 ${CONDITION_SOURCES.map((s) => `"${s}"`).join(" | ")}`
+    );
+  }
+  const picked = context ? context[source] : undefined;
+  if (picked === undefined || picked === null) {
+    throw new Error(
+      `条件声明了 source: "${source}"，但求值上下文未提供该数据源（field=${condition.field}）：` +
+      (source === "target"
+        ? "受益节点侧条件需要目标节点对象 —— target=\"SOURCE\" 的奖励请给 distributeByDefs 传入 sourceNode"
+        : "事件侧条件需要事件对象 —— 等级评估（evaluateTier）没有事件上下文，rankDefs 的条件请勿声明 source: \"event\"")
+    );
+  }
+  return picked;
+}
 
 /**
  * 从数据对象中按字段路径解析值
@@ -56,12 +101,14 @@ function _resolveField(data, field, subKey) {
  * 执行原子 COMPARE 条件评估
  *
  * @private
- * @param {Object} condition - { field, operator, value, subKey? }
- * @param {Object} data - 数据源
+ * @param {Object} condition - { field, operator, value, subKey?, source? }
+ * @param {Object} data - 默认数据源（condition.source 未声明时使用）
+ * @param {Object} [context] - 命名数据源 { event?, target? }（condition.source 声明时使用）
  * @returns {boolean}
  */
-function _evaluateCompare(condition, data) {
-  const actual = _resolveField(data, condition.field, condition.subKey);
+function _evaluateCompare(condition, data, context) {
+  const dataSource = _resolveDataSource(condition, data, context);
+  const actual = _resolveField(dataSource, condition.field, condition.subKey);
   const expected = condition.value;
   // 统一 trim 后判断：decimal.js 不接受带空格数字（" 5 " 崩溃），
   // _isNumeric 与 Decimal 比较必须使用同一规范化值（trim 后），避免误判崩溃
@@ -120,19 +167,26 @@ function _isNumeric(value) {
  * - NOT：对唯一子条件取反（子条件 > 1 时等同 AND 后取反）
  *
  * 原子条件：
- * - COMPARE：按 field/operator/value 比较
+ * - COMPARE：按 field/operator/value 比较；可选 source 指定数据源（"event" | "target"）
  *
  * @param {Object} condition - 条件定义（可以是普通对象或 Condition 实例）
- * @param {Object} data - 数据源（如引擎节点 { directCount, teamPerformance, higherTierCounts, attrs }）
- * @param {Object} [context] - 可选上下文（预留，如求值时间、环境标记）
+ * @param {Object} data - 默认数据源（如引擎节点 { directCount, teamPerformance, higherTierCounts, attrs }）
+ * @param {Object} [context] - 命名数据源 { event?, target? }，供 COMPARE 的 source 选取；
+ *        未声明 source 的条件不受影响（仍对 data 求值）
  * @returns {boolean} 条件是否满足
  */
 function evaluateCondition(condition, data, context) {
-  if (!condition || !condition.type) return false;
+  if (!condition || typeof condition !== "object") return false;
+  // 扁平 COMPARE 容错：{ field, operator, value } 缺 type 时按 COMPARE 处理。
+  // 调用方（reward-distributor / rank-evaluator）只在 conditions 数组的**顶层**补
+  // type: "COMPARE"，复合条件的 children 不会被补；若此处直接 return false，
+  // 「配了门槛却永远拦住」会变成静默少发 —— 与配错门槛同属难以发现的资金问题。
+  const type = condition.type || (condition.field !== undefined ? "COMPARE" : null);
+  if (!type) return false;
 
-  switch (condition.type) {
+  switch (type) {
     case "COMPARE":
-      return _evaluateCompare(condition, data);
+      return _evaluateCompare(condition, data, context);
 
     case "AND": {
       if (!Array.isArray(condition.children) || condition.children.length === 0) return true;
@@ -158,4 +212,4 @@ function evaluateCondition(condition, data, context) {
   }
 }
 
-module.exports = { evaluateCondition, _resolveField, _evaluateCompare };
+module.exports = { evaluateCondition, _resolveField, _evaluateCompare, CONDITION_SOURCES };

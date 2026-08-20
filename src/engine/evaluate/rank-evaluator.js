@@ -19,7 +19,7 @@
  * 直推数与高级别下属数）。若在 V4 不满足时 break，会把本应晋升 V5 的会员误判为 V3，
  * 直接导致团队极差比例 30% -> 15% 的资金损失。抽取前 vip.service 的原实现就是扫描全部等级。
  *
- * @version 2.2.0
+ * @version 2.3.0
  */
 
 const Decimal = require("../../decimal");
@@ -52,6 +52,15 @@ function _getLevelIndex(tier) {
   if (tier.metadata) return tier.levelIndex;
   return tier.levelIndex ?? tier.tier_level ?? 0;
 }
+// 等级关联的分成比例（百分比整数）。读取顺序：metadata.rankRate → 顶层 rankRate → 遗留 rank_rate → "0"。
+// 注意：RANK 阶段写入 node.rankRate 用 tier.rankRate（顶层字段），
+// 因此 fail-closed 判定必须与之一致地读 rankRate（含 metadata 回退）。
+function _getRankRate(tier) {
+  if (tier.metadata && tier.metadata.rankRate !== undefined) return String(tier.metadata.rankRate);
+  if (tier.rankRate !== undefined) return String(tier.rankRate);
+  if (tier.rank_rate !== undefined) return String(tier.rank_rate);
+  return "0";
+}
 
 /**
  * 判断单个节点是否满足某个等级的条件（纯计算）
@@ -74,7 +83,11 @@ function evaluateTier(node, tier) {
       : { type: "AND", children: conditions.map((c) =>
           c.type ? c : { type: "COMPARE", ...c }
         ) };
-    return evaluateCondition(wrapper, node);
+    // 等级评估的数据源就是被评估的节点本身：以 target 命名数据源传入，
+    // 使 rankDefs 里显式写 source:"target" 的条件同样可用（语义一致）。
+    // 等级评估没有事件上下文，因此 source:"event" 会在 condition-evaluator 抛错 ——
+    // 这是配置错误（等级门槛不该依赖某一次事件），不应静默按节点求值。
+    return evaluateCondition(wrapper, node, { target: node });
   }
 
   // ===== 遗留字段模式（兼容层：宿主等级表的 min_* 字段直接映射，未翻译为 conditions） =====
@@ -87,18 +100,28 @@ function evaluateTier(node, tier) {
   const requiredHigherTier = _getRequiredHigherTier(tier);
 
   // 资金安全（P0-2 fail-closed）：levelIndex > 0 的等级若既无 conditions、
-  // 也无任何遗留门槛来源（min_* 全为 0 且无有效的 requiredHigherTier），说明该等级
-  // 没有任何晋升条件 —— 此时必须判定为「不满足」，而不是「全部门槛取 0 逐项
-  // 跳过 → return true」。否则配置漏写 conditions 会让所有节点直接命中最高等级、
-  // 顶格分成比例（超发）。安全默认是 fail-closed：无条件来源即不晋升。
-  // 注意：requiredHigherTier === null（DB 显式 NULL）时高级别下属检查会被跳过，
-  // 因此 null 不构成有效门槛，只有 undefined（单值模式）或具体等级号（per-tier）才算。
+  // 也无任何遗留门槛来源（min_* 全为 0），且有关联分成比例（rankRate > 0），
+  // 说明该等级「无晋升门槛 + 会发钱」—— 配置漏写 conditions 会让所有节点
+  // 直接命中该等级、顶格分成比例（超发）。此时必须判定为「不满足」。
+  //
+  // 但若 rankRate 为 0 或未定义（无分成比例），等级命中本身不直接发钱，
+  // 非单调等级设计（如 V3 无条件但 levelIndex 比 V2 高）是合法业务模式，
+  // 不应被 fail-closed 破坏。此时放宽判定，允许通过。
+  //
+  // 注意：minHigherTierCount > 0 本身就是有效门槛（声明了「需要高级别下属」），
+  // 不应因 requiredHigherTier === null 而否定它 —— requiredHigherTier 为 null 时
+  // 只是「跳过该检查（视为满足）」，门槛声明仍然存在，等级仍是有条件的。
   const hasAnyLegacyGate =
     minDirectCount > 0 ||
     minTeamPerformance > 0 ||
-    (minHigherTierCount > 0 && requiredHigherTier !== null);
+    minHigherTierCount > 0;
   if (!hasAnyLegacyGate) {
-    return false;
+    // 无门槛等级：仅当有关联分成比例（rankRate > 0）时 fail-closed，
+    // 否则只是等级提升（不发钱），非单调设计是合法业务模式。
+    const tierRankRate = _getRankRate(tier);
+    if (tierRankRate && Decimal.gt(tierRankRate, "0")) {
+      return false;
+    }
   }
 
   if (minDirectCount > 0) {

@@ -7,6 +7,7 @@
  * - settle 幂等快路径 / 完整流程 / 唯一约束兜底 / 异常上抛
  * - batchSettle 批量原子性（全部成功 / 部分失败全回滚）
  * - list 分页转发、getByWhere 空条件拒绝
+ * - reverse 冲正（幂等键独立、事务内读原始记录、无可追回记录、唯一约束兜底）
  *
  * 所有测试使用 mock model + mock sequelize，不依赖真实数据库。
  * 引擎核心计算（executePipeline）在 engine-core.test.js 中独立覆盖。
@@ -24,8 +25,14 @@ const mockNormalizePagination = jest.fn((p, ps) => {
   return { page, pageSize, offset: (page - 1) * pageSize };
 });
 
+// 冲正计算器用真实实现（金额语义必须真跑），外层包一层 jest.fn 以便断言透传的入参
+const mockReverseRecords = jest.fn((...args) =>
+  jest.requireActual("../src/engine/reverse").reverseRecords(...args)
+);
+
 jest.mock("../src/engine", () => ({
   Orchestrate: { executePipeline: mockExecutePipeline },
+  Reverse: { reverseRecords: mockReverseRecords },
 }));
 
 jest.mock("../src/adapters", () => ({
@@ -34,6 +41,8 @@ jest.mock("../src/adapters", () => ({
 
 jest.mock("../src/utils", () => ({
   normalizePagination: mockNormalizePagination,
+  // 生效期判定用真实实现：时区语义（左闭右开、必须带偏移量）必须真跑，mock 掉等于没测
+  isWithinWindow: jest.requireActual("../src/utils/instant-window").isWithinWindow,
 }));
 
 // Mock sequelize（可选 peer）— 工厂内联定义，避免引用外部变量
@@ -46,7 +55,11 @@ jest.mock("sequelize", () => {
 
 // ===================== 导入被测试模块 =====================
 
-const { GenericSettlementService, REQUIRED_CONFIG_KEYS } = require("../src/services/generic-settlement.service");
+const {
+  GenericSettlementService,
+  REQUIRED_CONFIG_KEYS,
+  REQUIRED_REVERSAL_KEYS,
+} = require("../src/services/generic-settlement.service");
 // sequelize 已被 jest.mock（返回 UCE），此处解构 mock 的 UniqueConstraintError 供测试内构造冲突异常
 const { UniqueConstraintError } = require("sequelize");
 
@@ -654,6 +667,591 @@ describe("GenericSettlementService", () => {
         { ruleSetCode: "promo_v2" }
       );
       expect(cfg.logger.warn).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---------- reverse（冲正） ----------
+  describe("reverse", () => {
+    /** 在最小配置上补一个可用的 reversal 块 */
+    function makeReversalConfig(revOverrides = {}, cfgOverrides = {}) {
+      const cfg = makeMinimalConfig(cfgOverrides);
+      cfg.reversal = {
+        loadOriginalRecords: jest.fn(async () => [
+          { id: "rec1", member_id: "u1", amount: "100" },
+          { id: "rec2", member_id: "u2", amount: "50" },
+        ]),
+        buildOriginalRecord: jest.fn((row) => ({
+          recordId: row.id,
+          nodeId: row.member_id,
+          amount: row.amount,
+          rewardId: "referral",
+        })),
+        resolveReversal: jest.fn(() => ({ ratio: "100" })),
+        buildRecord: jest.fn((event, record) => ({
+          refund_no: event.refundNo,
+          member_id: record.nodeId,
+          amount: record.amount,
+          direction: record.direction,
+        })),
+        idempotency: {
+          buildPreReadWhere: jest.fn((event) => ({ refund_no: event.refundNo })),
+          buildFallbackWhere: jest.fn((event) => ({ refund_no: event.refundNo })),
+        },
+        ...revOverrides,
+      };
+      return cfg;
+    }
+
+    beforeEach(() => {
+      mockReverseRecords.mockClear();
+    });
+
+    test("未配置 reversal 时 reverse 返回 success:false（不抛错）", async () => {
+      const svc = new GenericSettlementService(makeMinimalConfig());
+      const result = await svc.reverse({ refundNo: "RF001" });
+      expect(result.success).toBe(false);
+      expect(result.message).toContain("未配置 reversal");
+    });
+
+    test("reversal 块缺必填项时构造期抛错", () => {
+      const cfg = makeReversalConfig();
+      delete cfg.reversal.resolveReversal;
+      expect(() => new GenericSettlementService(cfg)).toThrow(
+        "GenericSettlement reversal 配置缺少必填项: resolveReversal"
+      );
+    });
+
+    test("reversal.idempotency 缺函数时构造期抛错", () => {
+      const cfg = makeReversalConfig({ idempotency: { buildPreReadWhere: () => ({ a: 1 }) } });
+      expect(() => new GenericSettlementService(cfg)).toThrow(
+        "reversal.idempotency 必须提供 buildPreReadWhere 与 buildFallbackWhere"
+      );
+    });
+
+    test("REQUIRED_REVERSAL_KEYS 导出常量内容正确", () => {
+      expect(REQUIRED_REVERSAL_KEYS).toEqual([
+        "loadOriginalRecords",
+        "buildOriginalRecord",
+        "resolveReversal",
+        "buildRecord",
+        "idempotency",
+      ]);
+    });
+
+    test("全额冲正：落负金额记录并提交事务", async () => {
+      const cfg = makeReversalConfig();
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll.mockResolvedValue([]); // 幂等预读未命中
+      cfg.model.create.mockImplementation(async (r) => ({ ...r, id: 1 }));
+
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.reverse({ refundNo: "RF001" });
+
+      expect(result.success).toBe(true);
+      expect(result.idempotent).toBe(false);
+      expect(result.data.lines).toHaveLength(2);
+      expect(result.data.summary.recordCount).toBe(2);
+      expect(cfg.model.create).toHaveBeenCalledTimes(2);
+      expect(cfg.model.create.mock.calls[0][0]).toEqual(
+        expect.objectContaining({ refund_no: "RF001", member_id: "u1", amount: "-100", direction: "REVERSAL" })
+      );
+      expect(tx.commit).toHaveBeenCalledTimes(1);
+      expect(tx.rollback).not.toHaveBeenCalled();
+    });
+
+    test("原始记录在【事务内】读取（宿主可加行锁，避免并发超额追回）", async () => {
+      const cfg = makeReversalConfig();
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll.mockResolvedValue([]);
+      cfg.model.create.mockImplementation(async (r) => r);
+
+      const svc = new GenericSettlementService(cfg);
+      await svc.reverse({ refundNo: "RF001" }, { extra: 1 });
+
+      expect(cfg.reversal.loadOriginalRecords).toHaveBeenCalledWith(
+        { refundNo: "RF001" },
+        expect.objectContaining({ transaction: tx, options: { extra: 1 } })
+      );
+    });
+
+    test("幂等键用 reversal.idempotency（退款单号），不复用发放侧订单号", async () => {
+      const cfg = makeReversalConfig();
+      cfg.model.findAll.mockResolvedValue([{ id: 9, refund_no: "RF001" }]);
+
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.reverse({ refundNo: "RF001" });
+
+      expect(result.success).toBe(true);
+      expect(result.idempotent).toBe(true);
+      expect(result.data.lines).toHaveLength(1);
+      expect(cfg.model.findAll).toHaveBeenCalledWith({ where: { refund_no: "RF001" } });
+      expect(cfg.idempotency.buildPreReadWhere).not.toHaveBeenCalled();
+      expect(cfg.sequelize.transaction).not.toHaveBeenCalled();
+    });
+
+    test("缺少冲正幂等键字段时返回 { success:false }，不开事务", async () => {
+      const cfg = makeReversalConfig();
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.reverse({});
+      expect(result.success).toBe(false);
+      expect(result.message).toContain("refund_no");
+      expect(cfg.sequelize.transaction).not.toHaveBeenCalled();
+    });
+
+    test("无可冲正的原始记录：skipped，不落账不报错", async () => {
+      const cfg = makeReversalConfig({ loadOriginalRecords: jest.fn(async () => []) });
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll.mockResolvedValue([]);
+
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.reverse({ refundNo: "RF001" });
+
+      expect(result.success).toBe(true);
+      expect(result.data.skipped).toBe(true);
+      expect(result.data.lines).toEqual([]);
+      expect(cfg.model.create).not.toHaveBeenCalled();
+      expect(tx.rollback).toHaveBeenCalledTimes(1);
+      expect(tx.commit).not.toHaveBeenCalled();
+    });
+
+    test("loadOriginalRecords 返回非数组：抛错并回滚（不静默当作无可追回）", async () => {
+      const cfg = makeReversalConfig({ loadOriginalRecords: jest.fn(async () => null) });
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll.mockResolvedValue([]);
+
+      const svc = new GenericSettlementService(cfg);
+      await expect(svc.reverse({ refundNo: "RF001" })).rejects.toThrow(
+        "reversal.loadOriginalRecords 必须返回数组"
+      );
+      expect(tx.rollback).toHaveBeenCalledTimes(1);
+    });
+
+    test("已全额冲正（loadReversedMap）：skipped，不产生第二条扣款", async () => {
+      const cfg = makeReversalConfig({
+        loadReversedMap: jest.fn(async () => new Map([["rec1", "100"], ["rec2", "50"]])),
+      });
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll.mockResolvedValue([]);
+
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.reverse({ refundNo: "RF002" });
+
+      expect(result.success).toBe(true);
+      expect(result.data.skipped).toBe(true);
+      expect(result.data.summary.skippedCount).toBe(2);
+      expect(cfg.model.create).not.toHaveBeenCalled();
+      expect(tx.rollback).toHaveBeenCalledTimes(1);
+    });
+
+    test("部分退款：reversalValue/originalEventValue 透传引擎，按比例追回", async () => {
+      const cfg = makeReversalConfig({
+        resolveReversal: jest.fn(() => ({ reversalValue: "300", originalEventValue: "1000" })),
+      });
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll.mockResolvedValue([]);
+      cfg.model.create.mockImplementation(async (r) => r);
+
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.reverse({ refundNo: "RF003" });
+
+      expect(mockReverseRecords).toHaveBeenCalledWith(
+        expect.objectContaining({ reversalValue: "300", originalEventValue: "1000", onExceed: "CLAMP" })
+      );
+      expect(result.data.summary.basis).toBe("EVENT_VALUE");
+      expect(cfg.model.create.mock.calls[0][0].amount).toBe("-30");
+      expect(cfg.model.create.mock.calls[1][0].amount).toBe("-15");
+    });
+
+    test("resolveReversal 未给比例：引擎抛错并回滚（不默认全额冲正）", async () => {
+      const cfg = makeReversalConfig({ resolveReversal: jest.fn(() => ({})) });
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll.mockResolvedValue([]);
+
+      const svc = new GenericSettlementService(cfg);
+      await expect(svc.reverse({ refundNo: "RF001" })).rejects.toThrow("必须提供冲正比例");
+      expect(tx.rollback).toHaveBeenCalledTimes(1);
+      expect(cfg.model.create).not.toHaveBeenCalled();
+    });
+
+    test("buildRecord 全部返回 null：skipped，不落账", async () => {
+      const cfg = makeReversalConfig({ buildRecord: jest.fn(() => null) });
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll.mockResolvedValue([]);
+
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.reverse({ refundNo: "RF001" });
+
+      expect(result.success).toBe(true);
+      expect(result.data.skipped).toBe(true);
+      expect(result.data.summary.recordCount).toBe(2);
+      expect(tx.rollback).toHaveBeenCalledTimes(1);
+    });
+
+    test("唯一约束冲突走幂等兜底（并发同一笔退款）", async () => {
+      const cfg = makeReversalConfig();
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll
+        .mockResolvedValueOnce([])                       // 事务外预读未命中
+        .mockResolvedValueOnce([{ id: 5, refund_no: "RF001" }]); // 兜底查询命中
+      cfg.model.create.mockRejectedValue(new UniqueConstraintError("dup"));
+
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.reverse({ refundNo: "RF001" });
+
+      expect(result.success).toBe(true);
+      expect(result.idempotent).toBe(true);
+      expect(result.data.lines).toHaveLength(1);
+      expect(cfg.reversal.idempotency.buildFallbackWhere).toHaveBeenCalledWith({ refundNo: "RF001" });
+      expect(cfg.idempotency.buildFallbackWhere).not.toHaveBeenCalled();
+      expect(tx.rollback).toHaveBeenCalledTimes(1);
+    });
+
+    test("useBulkCreate 时用 bulkCreate 一次插入", async () => {
+      const cfg = makeReversalConfig({}, { useBulkCreate: true });
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll.mockResolvedValue([]);
+      cfg.model.bulkCreate.mockResolvedValue([{ id: 1 }, { id: 2 }]);
+
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.reverse({ refundNo: "RF001" });
+
+      expect(cfg.model.bulkCreate).toHaveBeenCalledTimes(1);
+      expect(cfg.model.create).not.toHaveBeenCalled();
+      expect(result.data.lines).toHaveLength(2);
+    });
+
+    test("只调用 reversal.postProcess，不复用发放侧 postProcess（防重复计数）", async () => {
+      const revPost = jest.fn(async () => {});
+      const payoutPost = jest.fn(async () => {});
+      const cfg = makeReversalConfig({ postProcess: revPost }, { postProcess: payoutPost });
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll.mockResolvedValue([]);
+      cfg.model.create.mockImplementation(async (r) => r);
+
+      const svc = new GenericSettlementService(cfg);
+      await svc.reverse({ refundNo: "RF001" });
+
+      expect(revPost).toHaveBeenCalledTimes(1);
+      expect(revPost).toHaveBeenCalledWith({ refundNo: "RF001" }, expect.any(Array), tx);
+      expect(payoutPost).not.toHaveBeenCalled();
+    });
+
+    test("冲正不持久化封顶水位（不回退已用额度，防退款套利）", async () => {
+      const saveCapState = jest.fn(async () => {});
+      const cfg = makeReversalConfig({}, { saveCapState, loadCapState: jest.fn(async () => null) });
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.model.findAll.mockResolvedValue([]);
+      cfg.model.create.mockImplementation(async (r) => r);
+
+      const svc = new GenericSettlementService(cfg);
+      await svc.reverse({ refundNo: "RF001" });
+
+      expect(saveCapState).not.toHaveBeenCalled();
+      expect(cfg.loadCapState).not.toHaveBeenCalled();
+    });
+  });
+
+
+  // ---------- 跨结算周期封顶（v4.0.0 §14：WEEKLY / MONTHLY / TOTAL）----------
+  describe("跨周期封顶必须成对配置水位钩子", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    /**
+     * 装配一个「含非 DAILY 周期封顶」的规则集与可落账的流水线产出。
+     * @param {Object} cfg - makeMinimalConfig() 产物
+     * @param {Array<Object>} capDefs - 封顶配置
+     * @param {Object|null} capStateOut - 引擎推进后回传的水位（context.capState）
+     */
+    function mockCapRuleSet(cfg, capDefs, capStateOut = null) {
+      cfg.model.findAll.mockResolvedValue([]);
+      cfg.ruleSetService.getActiveRuleSet.mockResolvedValue({
+        success: true,
+        data: {
+          config_json: {
+            rewardDefs: [{ rewardId: "commission", type: "DIRECT", target: "PARENT", rate: "10" }],
+            capDefs,
+          },
+        },
+      });
+      mockBuildPipelineStages.mockReturnValue([
+        { id: "distribute", handler: "DISTRIBUTE", config: {} },
+        { id: "cap", handler: "CAP", config: { capDefs } },
+      ]);
+      mockExecutePipeline.mockReturnValue({
+        results: { cap: [{ rewardId: "commission", nodeId: "u0", amount: "100" }] },
+        final: [{ rewardId: "commission", nodeId: "u0", amount: "100" }],
+        context: capStateOut ? { capState: capStateOut } : {},
+      });
+      cfg.model.create.mockResolvedValue({ id: 1, order_no: "O001", reward_id: "commission", amount: "100" });
+    }
+
+    test("PLATFORM_MONTHLY 封顶但未配水位钩子：拒绝结算、不开事务、不落账", async () => {
+      const cfg = makeMinimalConfig();
+      mockCapRuleSet(cfg, [{ capId: "m", scope: "PLATFORM_MONTHLY", limit: "50000" }]);
+      const svc = new GenericSettlementService(cfg);
+
+      const result = await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/必须成对配置 loadCapState \/ saveCapState/);
+      expect(result.message).toContain("PLATFORM_MONTHLY");
+      // 水位每次从 0 起算会把「月封顶 5 万」退化成「单事件封顶 5 万」：必须在落账前拦下
+      expect(cfg.sequelize.transaction).not.toHaveBeenCalled();
+      expect(cfg.model.create).not.toHaveBeenCalled();
+    });
+
+    test("只配了 loadCapState：仍拒绝并指名缺少的那一个钩子", async () => {
+      const cfg = makeMinimalConfig();
+      mockCapRuleSet(cfg, [{ capId: "w", scope: "PER_USER_WEEKLY", limit: "500" }]);
+      const svc = new GenericSettlementService({ ...cfg, loadCapState: jest.fn() });
+
+      const result = await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain("PER_USER_WEEKLY");
+      expect(result.message).toContain("saveCapState");
+      expect(result.message).not.toContain("缺少 loadCapState");
+      expect(cfg.sequelize.transaction).not.toHaveBeenCalled();
+    });
+
+    test("成对配置后正常落账，含 periods 的水位在事务内交给 saveCapState", async () => {
+      const tx = makeMockTransaction();
+      const cfg = makeMinimalConfig();
+      const loaded = {
+        platformPaid: "0",
+        memberPaid: new Map(),
+        periods: { MONTHLY: { platformPaid: "1000", memberPaid: new Map([["u0", "1000"]]) } },
+      };
+      const advanced = {
+        platformPaid: "100",
+        memberPaid: new Map([["u0", "100"]]),
+        periods: { MONTHLY: { platformPaid: "1100", memberPaid: new Map([["u0", "1100"]]) } },
+      };
+      mockCapRuleSet(cfg, [{ capId: "m", scope: "PLATFORM_MONTHLY", limit: "50000" }], advanced);
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      const loadCapState = jest.fn().mockResolvedValue(loaded);
+      const saveCapState = jest.fn().mockResolvedValue(undefined);
+      const svc = new GenericSettlementService({ ...cfg, loadCapState, saveCapState });
+
+      const result = await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" });
+
+      expect(result.success).toBe(true);
+      expect(loadCapState).toHaveBeenCalledTimes(1);
+      // 读到的历史水位（含 periods）必须原样进引擎 context
+      expect(mockExecutePipeline.mock.calls[0][0].context.capState).toBe(loaded);
+      // 推进后的水位在同一事务内持久化：periods 一并交给宿主
+      expect(saveCapState).toHaveBeenCalledTimes(1);
+      expect(saveCapState.mock.calls[0][0]).toBe(advanced);
+      expect(saveCapState.mock.calls[0][0].periods.MONTHLY.platformPaid).toBe("1100");
+      expect(saveCapState.mock.calls[0][1]).toBe(tx);
+      expect(tx.commit).toHaveBeenCalledTimes(1);
+      expect(tx.rollback).not.toHaveBeenCalled();
+    });
+
+    test("只配日封顶时未配钩子仍按历史行为放行（向后兼容）", async () => {
+      const tx = makeMockTransaction();
+      const cfg = makeMinimalConfig();
+      mockCapRuleSet(cfg, [
+        { capId: "d", scope: "PLATFORM_DAILY", limit: "5000" },
+        { capId: "u", scope: "PER_USER_DAILY", limit: "500" },
+      ]);
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      const svc = new GenericSettlementService(cfg);
+
+      const result = await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" });
+
+      expect(result.success).toBe(true);
+      expect(result.data.lines).toHaveLength(1);
+      expect(tx.commit).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ---------- 规则集生效期 / 活动加成（时间维度，fail-closed）----------
+  describe("时间维度：生效期与活动加成必须能取到事件发生时刻", () => {
+    const CAMPAIGN = {
+      campaignId: "dbl11",
+      startAt: "2026-11-11T00:00:00+08:00",
+      endAt: "2026-11-12T00:00:00+08:00",
+      multiplier: "2",
+    };
+    const EFFECTIVE = { startAt: "2026-11-01T00:00:00+08:00", endAt: "2026-12-01T00:00:00+08:00" };
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    /** 装配一个带时间维度的规则集与可落账的流水线产出。 */
+    function mockTimeRuleSet(cfg, { effective = null, campaignDefs = [] } = {}) {
+      cfg.model.findAll.mockResolvedValue([]);
+      cfg.ruleSetService.getActiveRuleSet.mockResolvedValue({
+        success: true,
+        data: {
+          config_json: {
+            rewardDefs: [{ rewardId: "commission", type: "DIRECT", target: "PARENT", rate: "10" }],
+            ...(effective ? { effective } : {}),
+            ...(campaignDefs.length ? { campaignDefs } : {}),
+          },
+        },
+      });
+      mockBuildPipelineStages.mockReturnValue([{ id: "distribute", handler: "DISTRIBUTE", config: {} }]);
+      mockExecutePipeline.mockReturnValue({
+        results: {},
+        final: [{ rewardId: "commission", nodeId: "u0", amount: "200" }],
+        context: {},
+      });
+      cfg.model.create.mockResolvedValue({ id: 1, order_no: "O001", reward_id: "commission", amount: "200" });
+    }
+
+    test("事件落在生效期内：正常落账，occurredAt 与 campaignDefs 一并交给适配层", async () => {
+      const tx = makeMockTransaction();
+      const cfg = makeMinimalConfig();
+      mockTimeRuleSet(cfg, { effective: EFFECTIVE, campaignDefs: [CAMPAIGN] });
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      const svc = new GenericSettlementService(cfg);
+
+      const result = await svc.settle({
+        orderNo: "O001",
+        buyerId: "u1",
+        amount: "1000",
+        occurredAt: "2026-11-11T10:00:00+08:00",
+      });
+
+      expect(result.success).toBe(true);
+      const [, opts] = mockBuildPipelineStages.mock.calls[0];
+      expect(opts.occurredAt).toBe("2026-11-11T10:00:00+08:00");
+      expect(mockBuildPipelineStages.mock.calls[0][0].campaignDefs).toEqual([CAMPAIGN]);
+      expect(tx.commit).toHaveBeenCalledTimes(1);
+    });
+
+    test("事件在生效期之后：拒绝结算、不开事务、不落账（过期规则集不得继续发放）", async () => {
+      const cfg = makeMinimalConfig();
+      mockTimeRuleSet(cfg, { effective: EFFECTIVE });
+      const svc = new GenericSettlementService(cfg);
+
+      const result = await svc.settle({
+        orderNo: "O001",
+        buyerId: "u1",
+        amount: "1000",
+        occurredAt: "2026-12-05T10:00:00+08:00",
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/不在生效期内/);
+      expect(result.message).toContain("左闭右开");
+      expect(cfg.sequelize.transaction).not.toHaveBeenCalled();
+      expect(cfg.model.create).not.toHaveBeenCalled();
+    });
+
+    test("生效期右开：endAt 当刻的事件不发放", async () => {
+      const cfg = makeMinimalConfig();
+      mockTimeRuleSet(cfg, { effective: EFFECTIVE });
+      const svc = new GenericSettlementService(cfg);
+
+      const result = await svc.settle({
+        orderNo: "O001",
+        buyerId: "u1",
+        amount: "1000",
+        occurredAt: EFFECTIVE.endAt,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/不在生效期内/);
+    });
+
+    test("配了活动加成但事件取不到发生时刻：拒绝结算并指名 buildOccurredAt（绝不用当前时间兜底）", async () => {
+      const cfg = makeMinimalConfig();
+      mockTimeRuleSet(cfg, { campaignDefs: [CAMPAIGN] });
+      const svc = new GenericSettlementService(cfg);
+
+      const result = await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain("campaignDefs 活动加成");
+      expect(result.message).toContain("buildOccurredAt");
+      expect(result.message).toMatch(/不会用当前时间兜底/);
+      expect(cfg.sequelize.transaction).not.toHaveBeenCalled();
+      expect(cfg.model.create).not.toHaveBeenCalled();
+    });
+
+    test("buildOccurredAt 钩子可指向宿主自己的时间字段（如 paid_at）", async () => {
+      const tx = makeMockTransaction();
+      const cfg = makeMinimalConfig();
+      mockTimeRuleSet(cfg, { campaignDefs: [CAMPAIGN] });
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      const buildOccurredAt = jest.fn((event) => event.paid_at);
+      const svc = new GenericSettlementService({ ...cfg, buildOccurredAt });
+
+      const result = await svc.settle({
+        orderNo: "O001",
+        buyerId: "u1",
+        amount: "1000",
+        paid_at: "2026-11-11T23:59:59+08:00",
+      });
+
+      expect(result.success).toBe(true);
+      expect(buildOccurredAt).toHaveBeenCalledTimes(1);
+      expect(mockBuildPipelineStages.mock.calls[0][1].occurredAt).toBe("2026-11-11T23:59:59+08:00");
+    });
+
+    test("生效期或事件时刻没写时区偏移：拒绝结算（不猜「在」或「不在」窗口内）", async () => {
+      const cfg = makeMinimalConfig();
+      mockTimeRuleSet(cfg, { effective: { startAt: "2026-11-01", endAt: "2026-12-01" } });
+      const svc = new GenericSettlementService(cfg);
+
+      const result = await svc.settle({
+        orderNo: "O001",
+        buyerId: "u1",
+        amount: "1000",
+        occurredAt: "2026-11-11T10:00:00+08:00",
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/生效期或事件时刻非法/);
+      expect(result.message).toMatch(/带偏移量的 ISO-8601/);
+      expect(cfg.sequelize.transaction).not.toHaveBeenCalled();
+    });
+
+    test("无时间维度的规则集：不取时刻、occurredAt 传 null（既有接入方零影响）", async () => {
+      const tx = makeMockTransaction();
+      const cfg = makeMinimalConfig();
+      mockTimeRuleSet(cfg, {});
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      const buildOccurredAt = jest.fn(() => "2026-11-11T10:00:00+08:00");
+      const svc = new GenericSettlementService({ ...cfg, buildOccurredAt });
+
+      const result = await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" });
+
+      expect(result.success).toBe(true);
+      expect(buildOccurredAt).not.toHaveBeenCalled();
+      expect(mockBuildPipelineStages.mock.calls[0][1].occurredAt).toBeNull();
+    });
+
+    test("缺省 buildOccurredAt 读事件的 occurredAt 字段，支持 Date 实例", async () => {
+      const tx = makeMockTransaction();
+      const cfg = makeMinimalConfig();
+      mockTimeRuleSet(cfg, { effective: EFFECTIVE });
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      const svc = new GenericSettlementService(cfg);
+      const at = new Date("2026-11-11T02:00:00Z");
+
+      const result = await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000", occurredAt: at });
+
+      expect(result.success).toBe(true);
+      expect(mockBuildPipelineStages.mock.calls[0][1].occurredAt).toBe(at);
     });
   });
 

@@ -8,8 +8,9 @@
  * 所有 DB 访问和事务边界由 Service 层负责，引擎只做"输入 → 计算 → 输出"。
  *
  * v2.3.0：新增 CUSTOM 固定金额奖励原语（amount 常量 + amountFrom 动态取数）。
+ * v2.4.0：新增 Reverse 冲正模块（已发放收益按比例反向追回，退款/撤单场景）。
  *
- * @version 2.3.0
+ * @version 2.4.0
  */
 
 const Distribute = require("./distribute");
@@ -17,6 +18,7 @@ const Evaluate = require("./evaluate");
 const Allocate = require("./allocate");
 const Orchestrate = require("./orchestrate");
 const Model = require("./model");
+const Reverse = require("./reverse");
 
 module.exports = {
   Distribute,
@@ -24,4 +26,5 @@ module.exports = {
   Allocate,
   Orchestrate,
   Model,
+  Reverse,
 };

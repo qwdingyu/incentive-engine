@@ -8,34 +8,52 @@
  * v1.1.0 新增 RANK 阶段装配：把规则集 rankDefs 注入 RANK stage，
  * 默认对直接上级与祖先链就地评估等级并写入 rankRate（供随后 DISTRIBUTE 消费）。
  *
- * @version 1.1.0
+ * v1.2.0 新增 sourceNode 透传：供 target:"SOURCE" + 受益节点侧条件的奖励求值。
+ *
+ * v1.3.0 新增 CAMPAIGN 阶段装配（活动期加成）：把规则集 campaignDefs 与运行期
+ * occurredAt（事件发生时刻，宿主提供）注入 CAMPAIGN stage。缺省流水线在**存在
+ * campaignDefs 时**自动插入 CAMPAIGN（位置固定在 DISTRIBUTE 之后、CAP 之前）——
+ * 否则配了活动却不加成（静默少发）；而放在 CAP 之后会绕过封顶（静默超发）。
+ *
+ * @version 1.3.0
  */
 
 /**
  * 从规则集配置组装流水线阶段
  *
  * @param {Object} config - 规则集 config_json
- *   { rewardDefs, capDefs, pipelineDef? }
+ *   { rewardDefs, capDefs, campaignDefs?, pipelineDef? }
  * @param {Object} input - 运行时输入
- *   { event, directParent?, ancestors? }
+ *   { event, sourceNode?, directParent?, ancestors?, occurredAt? }
+ *   occurredAt（事件发生时刻，Date 或带偏移量 ISO-8601）仅当存在 campaignDefs
+ *   或声明了 CAMPAIGN 阶段时必需 —— 引擎不取当前时间（结算重试/补跑会算错窗口）。
+ *   sourceNode（事件来源节点对象）仅当某条 target:"SOURCE" 的奖励带受益节点侧条件
+ *   （conditions 里 source:"target"）时必需；不参与 RANK 阶段评级（RANK 只评上级链）。
  * @returns {Array<Object>} executePipeline stages
  */
-function buildPipelineStages(config, { event, directParent = null, ancestors = [] }) {
+function buildPipelineStages(
+  config,
+  { event, sourceNode = null, directParent = null, ancestors = [], occurredAt = null }
+) {
   const rewardDefs = config.rewardDefs || [];
   const capDefs = config.capDefs || [];
+  const campaignDefs = config.campaignDefs || [];
 
-  // 优先使用规则集声明的 pipelineDef，缺省为 DISTRIBUTE → CAP。
-  const declaredStages = config.pipelineDef?.stages || [
-    { handler: "DISTRIBUTE" },
-    { handler: "CAP" },
-  ];
+  // 优先使用规则集声明的 pipelineDef；缺省为 DISTRIBUTE → CAP，
+  // 且**配了活动就自动插入 CAMPAIGN**（DISTRIBUTE 之后、CAP 之前）：
+  // 不插入 = 配了活动却不加成（静默少发）；插到 CAP 之后 = 加成绕过封顶（静默超发）。
+  const declaredStages = config.pipelineDef?.stages || (
+    campaignDefs.length > 0
+      ? [{ handler: "DISTRIBUTE" }, { handler: "CAMPAIGN" }, { handler: "CAP" }]
+      : [{ handler: "DISTRIBUTE" }, { handler: "CAP" }]
+  );
 
   return declaredStages.map((stage) => {
     if (stage.handler === "DISTRIBUTE") {
       return {
         id: stage.id || "distribute",
         handler: "DISTRIBUTE",
-        config: { event, directParent, ancestors, rewardDefs },
+        config: { event, sourceNode, directParent, ancestors, rewardDefs },
       };
     }
     if (stage.handler === "RANK") {
@@ -62,6 +80,18 @@ function buildPipelineStages(config, { event, directParent = null, ancestors = [
           rankDefs: config.rankDefs || [],
           nodes: uniqueNodes,
           overwrite: stage.config?.overwrite === true,
+        },
+      };
+    }
+    if (stage.handler === "CAMPAIGN") {
+      // CAMPAIGN（活动期加成）：注入规则集 campaignDefs 与运行期 occurredAt。
+      // 阶段可用 stage.config.campaignDefs 显式覆盖（如宿主按活动库动态传入）。
+      return {
+        id: stage.id || "campaign",
+        handler: "CAMPAIGN",
+        config: {
+          campaignDefs: stage.config?.campaignDefs || campaignDefs,
+          occurredAt: stage.config?.occurredAt ?? occurredAt,
         },
       };
     }

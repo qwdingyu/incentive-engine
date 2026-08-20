@@ -1,11 +1,13 @@
 {
   "name": "@usethink/incentive-engine",
-  "version": "3.4.10",
+  "version": "4.0.0",
   "description": "通用营销激励引擎 — 领域无关的纯计算核心，支持 DIRECT/LEVEL/FIXED/CUSTOM 奖励分配、封顶裁剪、预算兜底、等级评估、条件评估、流水线编排、配置校验、灰度版本路由",
   "main": "src/index.js",
+  "types": "src/index.d.ts",
   "scripts": {
     "test": "node --experimental-vm-modules node_modules/.bin/jest",
     "test:watch": "node --experimental-vm-modules node_modules/.bin/jest --watch",
+    "test:coverage": "node --experimental-vm-modules node_modules/.bin/jest --coverage",
     "smoke": "node scripts/smoke-require.js && node scripts/smoke-business.js",
     "prepublishOnly": "node scripts/verify-pack.js"
   },
@@ -46,5 +48,22 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "collectCoverageFrom": [
+      "src/**/*.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 85,
+        "statements": 92,
+        "lines": 92,
+        "functions": 95
+      },
+      "src/engine/**/*.js": {
+        "branches": 85
+      }
+    }
   }
 }
