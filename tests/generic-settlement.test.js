@@ -59,6 +59,7 @@ function makeMinimalConfig(overrides = {}) {
     ruleSetCode: "test_v1",
     model: {
       create: jest.fn(),
+      bulkCreate: jest.fn(),
       findAll: jest.fn(),
       findOne: jest.fn(),
       findAndCountAll: jest.fn(),
@@ -527,7 +528,7 @@ describe("GenericSettlementService", () => {
       expect(cfg.model.create).toHaveBeenCalledTimes(1);
     });
 
-    test("部分失败全部回滚", async () => {
+    test("部分失败全部回滚，并返回 { success: false }（不抛异常）", async () => {
       cfg.model.findAll.mockResolvedValue([]);
       mockBuildPipelineStages.mockReturnValue([{ id: "distribute", handler: "DISTRIBUTE", config: {} }]);
       mockExecutePipeline.mockReturnValue({
@@ -540,9 +541,119 @@ describe("GenericSettlementService", () => {
         { orderNo: "O001", buyerId: "u1", amount: "1000" },
         { orderNo: "O002", buyerId: "u2", amount: "2000" },
       ];
-      await expect(svc.batchSettle(events)).rejects.toThrow("落账失败");
+      // P2 错误契约一致性：与 batchSettle 其他失败出口、以及 settle 对齐 ——
+      // 统一返回 { success:false, message }，不再往外抛（调用方只查 success 就不会漏账）。
+      const result = await svc.batchSettle(events);
+      expect(result.success).toBe(false);
+      expect(result.message).toContain("落账失败");
+      expect(result.message).toContain("无部分落账");
       expect(tx.rollback).toHaveBeenCalledTimes(1);
       expect(tx.commit).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---------- useBulkCreate（P2 性能开关）----------
+  describe("useBulkCreate 批量插入开关", () => {
+    let cfg;
+    let tx;
+
+    beforeEach(() => {
+      cfg = makeMinimalConfig();
+      tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.ruleSetService.getActiveRuleSet.mockResolvedValue({ success: true, data: { config_json: { rewardDefs: [{ rewardId: "commission", type: "DIRECT", target: "PARENT", rate: "10" }] } } });
+      cfg.model.findAll.mockResolvedValue([]);
+      mockBuildPipelineStages.mockReturnValue([{ id: "distribute", handler: "DISTRIBUTE", config: {} }]);
+      mockExecutePipeline.mockReturnValue({
+        results: {},
+        final: [
+          { rewardId: "r1", nodeId: "u1", amount: "100" },
+          { rewardId: "r2", nodeId: "u2", amount: "50" },
+        ],
+        context: {},
+      });
+    });
+
+    test("缺省不启用：逐条 create（保持历史行为）", async () => {
+      cfg.model.create.mockResolvedValueOnce({ id: 1 }).mockResolvedValueOnce({ id: 2 });
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" });
+      expect(result.success).toBe(true);
+      expect(cfg.model.create).toHaveBeenCalledTimes(2);
+      expect(cfg.model.bulkCreate).not.toHaveBeenCalled();
+    });
+
+    test("useBulkCreate: true 时改走 bulkCreate（N 次 round-trip → 1 次）", async () => {
+      cfg.useBulkCreate = true;
+      cfg.model.bulkCreate.mockResolvedValue([{ id: 1 }, { id: 2 }]);
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" });
+      expect(result.success).toBe(true);
+      expect(cfg.model.bulkCreate).toHaveBeenCalledTimes(1);
+      expect(cfg.model.create).not.toHaveBeenCalled();
+      // 落账记录仍按 data.lines 返回，条数不变
+      expect(result.data.lines).toHaveLength(2);
+      // 与逐条路径一致：在同一事务内插入
+      expect(cfg.model.bulkCreate).toHaveBeenCalledWith(expect.any(Array), { transaction: tx });
+    });
+
+    test("model 未实现 bulkCreate 时安全回退到逐条 create", async () => {
+      cfg.useBulkCreate = true;
+      delete cfg.model.bulkCreate;
+      cfg.model.create.mockResolvedValueOnce({ id: 1 }).mockResolvedValueOnce({ id: 2 });
+      const svc = new GenericSettlementService(cfg);
+      const result = await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" });
+      expect(result.success).toBe(true);
+      expect(cfg.model.create).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ---------- ruleSetCode 告警（P2 日志噪音）----------
+  describe("ruleSetCode 告警只在真有误用信号时触发", () => {
+    let cfg;
+
+    beforeEach(() => {
+      cfg = makeMinimalConfig();
+      const tx = makeMockTransaction();
+      cfg.sequelize.transaction.mockResolvedValue(tx);
+      cfg.ruleSetService.getActiveRuleSet.mockResolvedValue({ success: true, data: { config_json: { rewardDefs: [{ rewardId: "commission", type: "DIRECT", target: "PARENT", rate: "10" }] } } });
+      cfg.model.findAll.mockResolvedValue([]);
+      cfg.model.create.mockResolvedValue({ id: 1 });
+      mockBuildPipelineStages.mockReturnValue([{ id: "distribute", handler: "DISTRIBUTE", config: {} }]);
+      mockExecutePipeline.mockReturnValue({
+        results: {},
+        final: [{ rewardId: "r1", nodeId: "u1", amount: "100" }],
+        context: {},
+      });
+    });
+
+    test("依赖构造默认规则集（事件内不带 ruleSetCode）不告警", async () => {
+      const svc = new GenericSettlementService(cfg);
+      await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000" });
+      expect(cfg.logger.warn).not.toHaveBeenCalled();
+    });
+
+    test("事件内 ruleSetCode 与生效规则集一致时不告警（无误用）", async () => {
+      const svc = new GenericSettlementService(cfg);
+      await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000", ruleSetCode: "test_v1" });
+      expect(cfg.logger.warn).not.toHaveBeenCalled();
+    });
+
+    test("事件内 ruleSetCode 与生效规则集不一致时告警（意图覆盖但传错位置）", async () => {
+      const svc = new GenericSettlementService(cfg);
+      await svc.settle({ orderNo: "O001", buyerId: "u1", amount: "1000", ruleSetCode: "promo_v2" });
+      expect(cfg.logger.warn).toHaveBeenCalledTimes(1);
+      expect(cfg.logger.warn.mock.calls[0][0]).toContain("promo_v2");
+      expect(cfg.logger.warn.mock.calls[0][0]).toContain("options.ruleSetCode");
+    });
+
+    test("显式传 options.ruleSetCode 时不告警（即使事件内不同）", async () => {
+      const svc = new GenericSettlementService(cfg);
+      await svc.settle(
+        { orderNo: "O001", buyerId: "u1", amount: "1000", ruleSetCode: "promo_v2" },
+        { ruleSetCode: "promo_v2" }
+      );
+      expect(cfg.logger.warn).not.toHaveBeenCalled();
     });
   });
 

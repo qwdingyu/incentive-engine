@@ -15,10 +15,9 @@
  * 宿主在调用前预计算；RANK 阶段就地评估 config.nodes 并写入 node.rankRate，
  * 随后的 DISTRIBUTE 即可消费（节点为对象引用，原地写立即可见）。
  *
- * 任意客户通过 stages 配置组合自己的流水线（对齐《03_通用营销激励引擎架构设计.md》§5.3
- * PipelineDef：阶段、依赖、共享状态）。
- * 松茸场景的订单收益流水线（含通用→松茸记录映射）见 src/adapters/songrong-reward-adapter.js，
- * 本模块不包含任何松茸业务。
+ * 任意客户通过 stages 配置组合自己的流水线（阶段 + 顺序 + 共享 context）。
+ * 本模块不包含任何具体业务：引擎记录 → 业务落账记录的映射由适配层的 buildRecord 完成
+ * （见 src/services/generic-settlement.service.js），纯计算示例见 src/adapters/customer-adapter-template.js。
  *
  * @version 2.3.0
  */

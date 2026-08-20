@@ -10,7 +10,7 @@
  * skipRankZero=true 时目标节点为最低等级（rankRate<=0）则不发放。
  *
  * 引擎不认识任何业务词（直推/佣金/返利是上层把业务规则翻译成 RewardDef 配置后的结果）。
- * 松茸场景的直推适配见 src/adapters/songrong-reward-adapter.js。
+ * 业务侧的直推规则由适配层翻译为 RewardDef，参考 src/adapters/customer-adapter-template.js。
  *
  * @version 2.3.0
  */

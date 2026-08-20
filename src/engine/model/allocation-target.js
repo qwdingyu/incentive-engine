@@ -5,7 +5,7 @@
  * 目标名由上层定义（locked_rongbei / mall_balance / LIQUID / POINT / cash），
  * 引擎只做"按 targets 比例拆分"，不解释目标含义。
  *
- * 对应《03_通用营销激励引擎架构设计.md》§4.4 AllocationDef.ratios 的最小实现。
+ * 「分给谁、分多少比例」的最小实现：一笔金额按 ratio 拆到任意科目。
  *
  * @version 1.0.0
  */

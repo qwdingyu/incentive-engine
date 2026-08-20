@@ -72,6 +72,35 @@ function createRuleSetValidation(Joi) {
     subKey: Joi.alternatives().try(Joi.string(), Joi.number()).allow(null).optional(),
   });
 
+  // 等级晋升条件校验（P0-2 资金安全，fail-closed）：
+  // levelIndex > 0 的等级必须提供 conditions 或 metadata/遗留 min_* 晋升门槛。
+  // 若两者皆无，配置在【校验期】即报错，而不是等求值时静默 fail-open ——
+  // 否则配置漏写 conditions 会让所有节点直接命中最高等级、顶格分成比例（超发）。
+  // 判定逻辑与 rank-evaluator.evaluateTier 的 hasAnyLegacyGate 严格一致，
+  // 保证「校验期通过 ⇒ 求值期存在实际门槛」。
+  function validateRankConditions(value, helpers) {
+    if (value.levelIndex > 0) {
+      const hasConditions = Array.isArray(value.conditions) && value.conditions.length > 0;
+      const metadata = value.metadata || {};
+      const minDirectCount = metadata.minDirectCount ?? value.min_direct_count ?? 0;
+      const minTeamPerformance = metadata.minTeamPerformance ?? value.min_team_performance ?? "0";
+      const minHigherTierCount = metadata.minHigherTierCount ?? value.min_higher_tier_count ?? 0;
+      const requiredHigherTier = metadata.requiredHigherTier !== undefined
+        ? metadata.requiredHigherTier
+        : value.required_higher_tier;
+      const hasAnyLegacyGate =
+        minDirectCount > 0 ||
+        minTeamPerformance > 0 ||
+        (minHigherTierCount > 0 && requiredHigherTier !== null);
+      if (!hasConditions && !hasAnyLegacyGate) {
+        return helpers.error("any.custom", {
+          message: `等级 ${value.rankId} (levelIndex=${value.levelIndex}) 必须提供 conditions 或 metadata.min* 晋升门槛（P0-2 资金安全：防止配置漏写导致全员顶格高等级）`,
+        });
+      }
+    }
+    return value;
+  }
+
   const rankDefSchema = Joi.object({
     rankId: Joi.string().max(64).required(),
     levelIndex: Joi.number().integer().min(0).required(),
@@ -79,7 +108,7 @@ function createRuleSetValidation(Joi) {
     rankRate: pctRateSchema,
     conditions: Joi.array().items(conditionSchema).optional(),
     metadata: Joi.object().optional(),
-  });
+  }).custom(validateRankConditions, "等级晋升条件校验（P0-2 fail-closed）");
 
   const capDefSchema = Joi.object({
     capId: Joi.string().max(64).required(),
@@ -88,6 +117,22 @@ function createRuleSetValidation(Joi) {
     onExceed: Joi.string().valid("REJECT", "ALERT_ONLY").default("REJECT").optional(),
   });
 
+    // 分配器 targets 比例总和校验（P0-3 资金安全）：
+  // PERCENTAGE_SPLIT 的 targets ratio 之和必须精确等于 100，否则拆分时
+  // 「最后一项补差」会吞掉全部剩余（如 A:30,B:20 → B 实得 70%），直接资金错分。
+  // 与 percentage-split-allocator.splitByTargets 的运行时校验一致，配置期即拦截。
+  function validateAllocatorRatioSum(value, helpers) {
+    if (value.type === "PERCENTAGE_SPLIT" && Array.isArray(value.targets)) {
+      const sum = value.targets.reduce((s, t) => s + Number(t.ratio), 0);
+      if (sum !== 100) {
+        return helpers.error("any.custom", {
+          message: `分配器 ${value.allocatorId} 的 targets ratio 之和必须为 100，当前=${sum}`,
+        });
+      }
+    }
+    return value;
+  }
+
   const allocatorSchema = Joi.object({
     allocatorId: Joi.string().max(64).required(),
     type: Joi.string().valid("PERCENTAGE_SPLIT").required(),
@@ -95,7 +140,7 @@ function createRuleSetValidation(Joi) {
       target: Joi.string().max(64).required(),
       ratio: nonNegativeSchema.required(),
     })).min(1).required(),
-  });
+  }).custom(validateAllocatorRatioSum, "分配器 targets 比例总和校验（P0-3）");
 
   const pipelineStageConfigSchema = Joi.object({
     totalBudget: Joi.alternatives()

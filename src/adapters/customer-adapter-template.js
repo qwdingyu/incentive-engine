@@ -30,15 +30,31 @@ const CUSTOMER_VERSION = "2.0.0";
 
 /** 将业务会员对象映射为引擎节点 */
 function _mapMemberToNode(member) {
-  return new engine.Model.EngineNode({
+  const node = new engine.Model.EngineNode({
     id: member.id,
     parentId: member.parentId || null,
     rankId: member.rank || "DEFAULT",
     attrs: {
       directCount: member.directCount || 0,
       teamPerformance: member.teamPerformance || "0",
+      ...(member.rankRate !== undefined ? { rankRate: member.rankRate } : {}),
     },
   });
+  // P1-3 修复：EngineNode 构造器不接受顶层 rankRate，需构造后手动赋值。
+  // rankRate 是引擎 DIRECT/LEVEL 消费的顶层字段（direct-calculator._isRankZero
+  // 只读 node.rankRate，不看 attrs 回退）。原实现丢弃 rankRate 导致全链按 0 处理，
+  // 叠加 skipRankZero 默认 true 后零发放。
+  //
+  // 关键：业务对象【没有】rankRate 时必须保持 node.rankRate 为 undefined，
+  // 不能兜底写 "0"。RANK 阶段用 `node.rankRate !== undefined` 判断「宿主是否已预计算」，
+  // 写死 "0" 会被当作预计算值而跳过等级评估 —— 节点永远停在最低等级、
+  // skipRankZero 默认 true 直接零发放（静默，无任何报错）。
+  // undefined 时 _isRankZero 仍安全回退为 0（少发不超发），二者不冲突。
+  const rankRate = member.rankRate ?? member.attrs?.rankRate;
+  if (rankRate !== undefined && rankRate !== null) {
+    node.rankRate = String(rankRate);
+  }
+  return node;
 }
 
 /** 将业务事件映射为引擎事件 */
@@ -66,6 +82,9 @@ function _buildRankDefs(tierConfigs) {
       id: cfg.id || index,
       levelIndex: cfg.levelIndex ?? index,
       rankId: cfg.name || `Level${index}`,
+      // P1-3 修复：透传 rankRate（等级关联的分成比例）。
+      // 原实现丢弃 rankRate 导致一律 "0"，叠加 skipRankZero 默认 true 后全链零发放。
+      rankRate: cfg.rankRate ?? "0",
       conditions,
       metadata: { ...cfg },
     });
@@ -75,10 +94,15 @@ function _buildRankDefs(tierConfigs) {
 /** 从业务配置构建奖励定义列表 */
 function _buildRewardDefs(rewardConfigs) {
   return (rewardConfigs || []).map((cfg, index) => new engine.Model.RewardDef({
-    id: cfg.id || index,
+    // P1-3 修复：用 rewardId 而非 id —— RewardDef 的落库标识字段是 rewardId，
+    // 原实现传 id 导致 rewardId: undefined，落库后无法区分奖励类型、无法对账。
+    rewardId: cfg.rewardId ?? cfg.id ?? `reward-${index}`,
     type: cfg.type || "DIRECT",
     rate: cfg.rate || "0",
-    accumulateInChain: cfg.accumulateInChain !== false,
+    // P1-3 修复：accumulateInChain 缺省应为 false（与 RewardDef 缺省一致）。
+    // 原实现 `cfg.accumulateInChain !== false` 使缺省为 true，会把「多级固定比例」
+    // 意外变成「极差」（只有 L1 拿到钱）。改为显式 true 才开启链式水位累加。
+    accumulateInChain: cfg.accumulateInChain === true,
     skipRankZero: cfg.skipRankZero !== false,
     metadata: { ...cfg },
   }));
@@ -111,9 +135,14 @@ function executeCustomerIncentive({ event, directParent, ancestors, ruleSet, cap
   // 兼容两种数据格式：
   // - 标准：ruleSet = { config_json: { rewardDefs, capDefs, pipelineDef }, rewardDefs, capDefs }
   // - 直接：ruleSet = { rewardDefs, capDefs, pipelineDef }
+  // P1-3 修复：rankDefs 必须与 rewardDefs/capDefs 一样做「顶层优先、config_json 回退」的
+  // 双形态归一。原实现只归一了 rewardDefs/capDefs，rankDefs 仅依赖对 config_json 的展开 ——
+  // 当规则集是标准形态（config_json 内只有 pipelineDef、rankDefs 挂在顶层）时 rankDefs 全丢，
+  // RANK 阶段拿到空等级表 → 节点 rankRate 恒为 0 → skipRankZero 默认 true → 零发放（静默）。
   const ruleSetConfig = {
     ...(ruleSet.config_json || ruleSet),
     rewardDefs: ruleSet.rewardDefs || ruleSet.config_json?.rewardDefs || [],
+    rankDefs: ruleSet.rankDefs || ruleSet.config_json?.rankDefs || [],
     capDefs: ruleSet.capDefs || ruleSet.config_json?.capDefs || [],
   };
   const stages = buildPipelineStages(ruleSetConfig, {
@@ -122,8 +151,10 @@ function executeCustomerIncentive({ event, directParent, ancestors, ruleSet, cap
     ancestors: ancestorNodes,
   });
 
-  const result = engine.Orchestrate.executePipeline({ stages, context: { capState } });
-  return result;
+  // capState 缺省时不要写入 context.capState: undefined —— 让 CAP 阶段走自己的零水位默认值，
+  // 避免下游用 `"capState" in context` 判断时误认为宿主传了水位。
+  const context = capState ? { capState } : {};
+  return engine.Orchestrate.executePipeline({ stages, context });
 }
 
 module.exports = {

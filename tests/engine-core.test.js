@@ -669,15 +669,33 @@ describe("Allocate", () => {
     expect(Decimal.eq(splits[1].amount, "300")).toBe(true);
   });
 
-  test("splitByTargets — 最后一项补差", () => {
-    const { splits } = Engine.Allocate.splitByTargets("1000", [
+  test("splitByTargets — 最后一项补差保证各分项之和精确等于总额", () => {
+    // 非整除金额：33% × 1000.05 有 4 位小数尾差，最后一项补差保证总和 == 总额。
+    // （P0-3 后 ratio 之和必须为 100，故用 33/67 表达，弃用旧的 33/33/33=99 错误配置）
+    const { splits, snapshot } = Engine.Allocate.splitByTargets("1000.05", [
       { target: "A", ratio: 33 },
-      { target: "B", ratio: 33 },
-      { target: "C", ratio: 33 },
+      { target: "B", ratio: 67 },
     ]);
-    expect(Decimal.eq(splits[0].amount, "330")).toBe(true);
-    // 最后一项补差：1000 - 330 - 330 = 340
-    expect(Decimal.eq(splits[2].amount, "340")).toBe(true);
+    // 资金不变量：各分项之和精确等于原金额
+    const sum = splits.reduce((s, sp) => Decimal.add(s, sp.amount), "0");
+    expect(Decimal.eq(sum, "1000.05")).toBe(true);
+    expect(Decimal.eq(splits[1].amount, Decimal.sub("1000.05", splits[0].amount))).toBe(true);
+    expect(snapshot).toEqual({ A: 33, B: 67 });
+  });
+
+  test("splitByTargets — ratio 之和不为 100 抛错（P0-3 资金安全）", () => {
+    // 三种错误比例均应在拆分前被拒绝，而不是静默错分（B 声明 20% 实得 70%）
+    expect(() => Engine.Allocate.splitByTargets("1000", [{ target: "A", ratio: 70 }])).toThrow(/必须为 100/);
+    expect(() => Engine.Allocate.splitByTargets("1000", [
+      { target: "A", ratio: 30 },
+      { target: "B", ratio: 20 },
+    ])).toThrow(/必须为 100/);
+    expect(() => Engine.Allocate.splitByTargets("1000", [
+      { target: "A", ratio: 60 },
+      { target: "B", ratio: 60 },
+    ])).toThrow(/必须为 100/);
+    // 空 targets 也拒绝
+    expect(() => Engine.Allocate.splitByTargets("1000", [])).toThrow(/不能为空/);
   });
 
   test("compareAmounts — MAX", () => {
@@ -759,6 +777,39 @@ describe("Evaluate", () => {
     expect(Engine.Evaluate.evaluateTier({ directCount: 10 }, rankDefs[0])).toBe(true);
     expect(Engine.Evaluate.evaluateTier({ directCount: 10 }, rankDefs[1])).toBe(true);
     expect(Engine.Evaluate.evaluateTier({ directCount: 2 }, rankDefs[1])).toBe(false);
+  });
+
+  test("evaluateTier — P0-2 fail-closed：levelIndex>0 且无任何条件来源返回 false", () => {
+    // 等级既无 conditions 也无 metadata/遗留 min_* 门槛 → 必须判定不满足（fail-closed），
+    // 而不是「全部门槛取 0 逐项跳过 → return true」导致全员顶格高等级。
+    const noGateTier = { rankId: "V9", levelIndex: 9, rankRate: "60" };
+    expect(Engine.Evaluate.evaluateTier({ directCount: 0, teamPerformance: "0" }, noGateTier)).toBe(false);
+    // 零活跃节点也不应命中无门槛的高等级
+    expect(Engine.Evaluate.evaluateTier({ directCount: 999, teamPerformance: "999999" }, noGateTier)).toBe(false);
+
+    // 对照：带 conditions 的等级正常评估
+    const withCondTier = { rankId: "V1", levelIndex: 1, conditions: [{ field: "directCount", operator: "GTE", value: 5 }] };
+    expect(Engine.Evaluate.evaluateTier({ directCount: 10 }, withCondTier)).toBe(true);
+    expect(Engine.Evaluate.evaluateTier({ directCount: 2 }, withCondTier)).toBe(false);
+
+    // 对照：遗留字段模式（metadata.minDirectCount）仍正常
+    const legacyTier = { rankId: "V2", levelIndex: 2, metadata: { minDirectCount: 3 } };
+    expect(Engine.Evaluate.evaluateTier({ directCount: 5 }, legacyTier)).toBe(true);
+    expect(Engine.Evaluate.evaluateTier({ directCount: 1 }, legacyTier)).toBe(false);
+  });
+
+  test("getHighestQualifiedTier — P0-2 fail-closed：无门槛高等级不再顶格命中", () => {
+    // 修复前：V9 无 conditions → 零活跃节点直接命中 V9（顶格 60%）。
+    // 修复后：V9 无任何条件来源 → 不满足，回落到 V0。
+    const result = Engine.Evaluate.getHighestQualifiedTier(
+      { id: "x", directCount: 0, teamPerformance: "0" },
+      [
+        { rankId: "V0", levelIndex: 0, rankRate: "0" },
+        { rankId: "V9", levelIndex: 9, rankRate: "60" },
+      ]
+    );
+    expect(result.rankId).toBe("V0");
+    expect(result.rankRate).toBe("0");
   });
 
   test("evaluateTier — 最低等级兜底", () => {
@@ -1224,6 +1275,10 @@ describe("Decimal", () => {
   test("add", () => expect(Decimal.eq(Decimal.add("10", "20"), "30")).toBe(true));
   test("sub", () => expect(Decimal.eq(Decimal.sub("20", "10"), "10")).toBe(true));
   test("div", () => expect(Decimal.eq(Decimal.div("100", "3"), "33.3333")).toBe(true));
+  test("div 除零抛错（P2 资金安全）", () => {
+    expect(() => Decimal.div("100", "0")).toThrow(/除数不能为 0/);
+    expect(() => Decimal.div("0", "0")).toThrow(/除数不能为 0/);
+  });
   test("round", () => expect(Decimal.round("33.3333", 2)).toBe("33.33"));
   test("pct", () => expect(Decimal.eq(Decimal.pct("1000", "5"), "50")).toBe(true));
   test("gte (true)", () => expect(Decimal.gte("10", "5")).toBe(true));

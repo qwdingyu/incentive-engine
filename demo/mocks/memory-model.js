@@ -2,7 +2,7 @@
  * 内存 Model 工厂 — 模拟 Sequelize Model 的最小可运行实现
  *
  * 用途：demo 与本地调试，无需数据库即可演示 GenericSettlementService 全流程。
- * 方法签名与真实 Sequelize Model 对齐：create / findAll / findOne / findAndCountAll。
+ * 方法签名与真实 Sequelize Model 对齐：create / bulkCreate / findAll / findOne / findAndCountAll。
  *
  * 特性：
  * - 自增 id + created_at
@@ -42,6 +42,16 @@ function createMemoryModel({ tableName = "memory_model", uniqueKeys = [], Unique
     return row;
   }
 
+  async function bulkCreate(records = []) {
+    // 与真实 Sequelize 对齐的最小实现：逐条走 create 的唯一约束检查，
+    // 任一条冲突即抛错（真实 DB 的批量插入同样整批失败）。
+    const created = [];
+    for (const record of records) {
+      created.push(await create(record));
+    }
+    return created;
+  }
+
   async function findAll({ where = {} } = {}) {
     return rows.filter((r) => matches(r, where));
   }
@@ -57,6 +67,7 @@ function createMemoryModel({ tableName = "memory_model", uniqueKeys = [], Unique
 
   return {
     create,
+    bulkCreate,
     findAll,
     findOne,
     findAndCountAll,

@@ -4,7 +4,8 @@
  * 领域无关的多维封顶裁剪：capDefs 数组驱动，每个 capDef 声明
  * scope（PLATFORM_DAILY 平台日封顶 / PER_USER_DAILY 单用户日封顶）与 limit（上限），
  * 引擎遍历 capDefs 逐维裁剪。任意客户通过配置声明自己的封顶维度。
- * 松茸平台/会员日封顶适配见 src/adapters/songrong-reward-adapter.js。
+ * 具体业务的封顶维度（平台日封顶、单用户日封顶等）由上层以 capDefs 声明，
+ * 引擎不内置任何业务口径。
  *
  * v2.2.0 新增：applyBudgetGuard — 总预算兜底保护，防止配错比例导致超发。
  *
@@ -29,9 +30,32 @@ const Decimal = require("../../decimal");
 function applyCaps(records, capDefs = [], state = { platformPaid: "0", memberPaid: new Map() }) {
   const cappedRecords = [];
 
+  // 资金安全（P1-1）：解析封顶定义前先校验 scope 合法性。
+  // 未知 scope 必须抛错而非静默放行 —— 否则配置写错 scope（如 PER_USER_MONTHLY）
+  // 会被当作「无此维度封顶」而完全不裁剪，直接超发。
+  // 注意：capDefSchema 的 scope 枚举已在校验期拦截，但 applyCaps 是纯计算路径，
+  // 可能绕过 Validation 直接调用，因此运行时也必须防御。
+  const VALID_SCOPES = new Set(["PLATFORM_DAILY", "PER_USER_DAILY"]);
+  for (const c of capDefs) {
+    if (!VALID_SCOPES.has(c.scope)) {
+      throw new Error(
+        `applyCaps：未知封顶 scope "${c.scope}"（支持: PLATFORM_DAILY, PER_USER_DAILY）`
+      );
+    }
+  }
+
   // 预解析有效封顶：limit>0 才参与裁剪。
-  const platformCap = capDefs.find((c) => c.scope === "PLATFORM_DAILY" && Decimal.gt(c.limit, "0"));
-  const memberCap = capDefs.find((c) => c.scope === "PER_USER_DAILY" && Decimal.gt(c.limit, "0"));
+  // 资金安全（P1-1）：同 scope 多条时取【最严】（limit 最小）而非第一条 ——
+  // 否则更严的第二条会被静默忽略（如 limit:1000 在前、limit:100 在后，实际按 1000 封顶）。
+  // 取最严是 fail-safe 方向：宁可少发，不可超发。
+  const platformCaps = capDefs.filter((c) => c.scope === "PLATFORM_DAILY" && Decimal.gt(c.limit, "0"));
+  const memberCaps = capDefs.filter((c) => c.scope === "PER_USER_DAILY" && Decimal.gt(c.limit, "0"));
+  const platformCap = platformCaps.length
+    ? platformCaps.reduce((a, b) => (Decimal.lte(a.limit, b.limit) ? a : b))
+    : null;
+  const memberCap = memberCaps.length
+    ? memberCaps.reduce((a, b) => (Decimal.lte(a.limit, b.limit) ? a : b))
+    : null;
   const dailyPlatformPayoutCap = platformCap ? String(platformCap.limit) : "0";
   const memberDailyYieldCap = memberCap ? String(memberCap.limit) : "0";
   // onExceed 语义：REJECT（默认）= 超出丢弃；ALERT_ONLY = 超出不裁剪、保留原金额，仅记录告警标记。
@@ -46,7 +70,9 @@ function applyCaps(records, capDefs = [], state = { platformPaid: "0", memberPai
     // 平台日封顶先裁剪：平台水位代表当天所有接收人的累计发放额。
     if (Decimal.gt(dailyPlatformPayoutCap, "0")) {
       const platformRemaining = Decimal.sub(dailyPlatformPayoutCap, state.platformPaid || "0");
-      if (Decimal.lt(allowedAmount, platformRemaining)) {
+      // 资金安全（P1-1）：恰好用尽剩余额度（allowedAmount == platformRemaining）不算超发，
+      // 应正常发放而非标记 ALERT_ONLY。故用 lte（<=）而非 lt（<）判断「未超限」。
+      if (Decimal.lte(allowedAmount, platformRemaining)) {
         // 未超限，正常
       } else if (platformOnExceed === "ALERT_ONLY") {
         // ALERT_ONLY：超限不裁剪，保留原金额，标记告警
@@ -62,7 +88,8 @@ function applyCaps(records, capDefs = [], state = { platformPaid: "0", memberPai
       const nodeId = record.nodeId ?? record.memberId;
       const memberPaid = state.memberPaid.get(nodeId) || "0";
       const memberRemaining = Decimal.sub(memberDailyYieldCap, memberPaid);
-      if (Decimal.lt(allowedAmount, memberRemaining)) {
+      // 同上：恰好用尽额度不算超发（lte 而非 lt）。
+      if (Decimal.lte(allowedAmount, memberRemaining)) {
         // 未超限，正常
       } else if (memberOnExceed === "ALERT_ONLY") {
         // ALERT_ONLY：超限不裁剪，保留原金额，标记告警

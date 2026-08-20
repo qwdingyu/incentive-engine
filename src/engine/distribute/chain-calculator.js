@@ -4,9 +4,10 @@
  * 领域无关的"链式水位差"分配：沿祖先链（近到远），每个节点拿
  * (自身 rankRate - 已累计水位) 的差额；rankRate 为百分比整数（15=15%）；
  * diffRate<=0 的节点跳过（同级/降级不发）；accumulateInChain=true 的奖励才推进水位。
- * 这是极差/级差/多级佣金的通用计算模式（《03_通用营销激励引擎架构设计.md》§4.3 LEVEL）。
+ * 这是极差/级差/多级佣金的通用计算模式（对应 RewardDef 的 LEVEL 类型）。
  *
- * 引擎不认识任何业务词；松茸团队极差适配见 src/adapters/songrong-reward-adapter.js。
+ * 引擎不认识任何业务词；团队极差等业务口径由适配层翻译为 LEVEL 配置，
+ * 参考 src/adapters/customer-adapter-template.js。
  *
  * @version 2.1.0
  */

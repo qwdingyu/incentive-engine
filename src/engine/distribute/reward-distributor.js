@@ -9,7 +9,7 @@
  * - CUSTOM                  → 固定金额常量 + 可选动态取数（amount / amountFrom；target 同 DIRECT）
  * - LEVEL                  → 链式差额（如"多级团队佣金/极差"）
  *
- * 松茸场景的候选构造见 src/adapters/songrong-reward-adapter.js。
+ * 具体业务的候选构造由适配层完成，参考 src/adapters/customer-adapter-template.js。
  *
  * @version 2.3.0
  */

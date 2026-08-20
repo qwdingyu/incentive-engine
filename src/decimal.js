@@ -51,10 +51,17 @@ function sub(a, b, dp = 4) {
 
 /**
  * 安全除法 → 返回 string
+ *
+ * 资金安全（P2）：除数为 0 必须抛错，不能静默返回 "0"。
+ * 原实现 `if (bDec.isZero()) return "0"` 会把「除以 0」静默降级为 0 ——
+ * 在金额链路上这是灾难性的：如「总金额 / 0」本应是配置错误，却静默产出 0，
+ * 掩盖了上游 bug。除零是明确的编程/配置错误，应 fail-fast 暴露而非吞掉。
  */
 function div(a, b, dp = 4) {
   const bDec = new Decimal(b || 0);
-  if (bDec.isZero()) return "0";
+  if (bDec.isZero()) {
+    throw new Error(`Decimal.div：除数不能为 0（被除数=${a}）`);
+  }
   return new Decimal(a || 0).div(bDec).toDecimalPlaces(dp, Decimal.ROUND_HALF_UP).toString();
 }
 

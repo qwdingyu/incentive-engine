@@ -81,7 +81,12 @@ if (error) {
 
 ### 架构原则
 
-1. **纯函数，零副作用**：所有计算函数不修改输入参数，不查询外部状态
+1. **默认纯函数，副作用仅限两处显式约定**：计算函数不查询外部状态、不做 IO。
+   ⚠️ 两处按设计有意为之的就地写（不是纯函数）：`applyCaps` 会就地推进封顶水位 `state`
+   （跨记录累计必须如此），`RANK` 阶段会就地写回节点的 `rankRate`/`rankId`
+   （供随后 DISTRIBUTE 立即可见）。复用输入对象做并发/重放时必须注意这两处 —— 重放同一批
+   `state` / 节点对象会导致水位重复累计或等级被前一次结果污染，正确做法是每次结算传入
+   新构造的 `state` 与节点对象。
 2. **领域无关**：引擎不认识任何业务实体（用户/订单/商品），只操作抽象节点和事件
 3. **配置驱动**：奖励规则、封顶策略、等级条件全部由上层配置注入
 4. **可组合**：通过流水线编排器将多个阶段组合成完整计算流程
@@ -214,7 +219,7 @@ const result = await customerService.settle(businessEvent);
 - 无落账记录时返回 `{ success: true, data: { skipped: true, lines: [] } }`
 - `settleWithTransaction` 在传入事务内做幂等预读，命中返回 `{ idempotent: true }`
 - `batchSettle([])` 空数组视为合法空批次，返回 `{ success: true, data: { results: [] } }`
-- **`ruleSetCode` 双传参契约**：三个入口 `settle(event, options)` / `settleWithTransaction(event, tx, options)` / `batchSettle(events, options)` 统一由 `options.ruleSetCode` 决定引擎**计算**选用的规则集；事件对象内的 `ruleSetCode` 字段不参与引擎选规则集（仅你的 `buildRecord` 用它落库 `rule_set_code` 审计列）。二者都缺省时退化为构造时 `config.ruleSetCode` 默认值。若 `_calculate` 打出 `未传 options.ruleSetCode` 的 warn，即提示漏传了覆盖——**需要覆盖规则集时务必显式传 `options.ruleSetCode`**，并把事件内 `ruleSetCode` 也带上用于落库。
+- **`ruleSetCode` 双传参契约**：三个入口 `settle(event, options)` / `settleWithTransaction(event, tx, options)` / `batchSettle(events, options)` 统一由 `options.ruleSetCode` 决定引擎**计算**选用的规则集；事件对象内的 `ruleSetCode` 字段不参与引擎选规则集（仅你的 `buildRecord` 用它落库 `rule_set_code` 审计列）。二者都缺省时退化为构造时 `config.ruleSetCode` 默认值。仅当**事件内 `ruleSetCode` 与本次生效规则集不一致**时 `_calculate` 才打 warn（那是「意图覆盖但传错位置」的确定信号）——正常依赖构造默认值不会产生日志噪音。需要覆盖规则集时务必显式传 `options.ruleSetCode`，并把事件内 `ruleSetCode` 也带上用于落库。
 
 ---
 
@@ -240,14 +245,45 @@ const { executeCustomerIncentive } = require("@usethink/incentive-engine").Adapt
 
 const result = executeCustomerIncentive({
   event: { memberId: "user1", amount: "1000", type: "purchase" },
-  directParent: { id: "user0", parentId: null, directCount: 10, teamPerformance: "50000" },
+  // ⚠️ directParent 必须带 rankRate（等级比例，百分比整数）：
+  //    skipRankZero 默认 true，rankRate 缺省为 0 会被当作最低等级而零发放。
+  directParent: { id: "user0", parentId: null, directCount: 10, teamPerformance: "50000", rankRate: "10" },
   ruleSet: {
     config_json: { pipelineDef: { stages: [{ handler: "DISTRIBUTE" }] } },
-    rewardDefs: [{ type: "DIRECT", rate: "10", target: "PARENT" }],
-    rankDefs: [{ levelIndex: 1, conditions: [{ type: "COMPARE", field: "directCount", operator: "GTE", value: 3 }] }],
+    // ⚠️ rewardDef 必须带 rewardId（落库/对账标识），type/rate/target 为百分比整数语义。
+    rewardDefs: [{ rewardId: "referral", type: "DIRECT", rate: "10", target: "PARENT" }],
+    rankDefs: [{ rankId: "V0", levelIndex: 0, rankRate: "0" }],
   },
 });
+// result.final = [{ nodeId: "user0", rewardId: "referral", amount: "100", ... }]  // 1000 × 10%
 ```
+
+**rankRate 的两条来路（二选一，缺一必零发放）**：
+
+```javascript
+// 方式 B：不预计算 rankRate，让引擎用 RANK 阶段按 rankDefs 现场评级
+const result = executeCustomerIncentive({
+  event: { memberId: "user1", amount: "1000", type: "purchase" },
+  directParent: { id: "user0", parentId: null, directCount: 10, teamPerformance: "50000" }, // 无 rankRate
+  ruleSet: {
+    // RANK 必须排在 DISTRIBUTE 之前：它把命中等级的 rankRate 就地写入节点
+    config_json: { pipelineDef: { stages: [{ handler: "RANK" }, { handler: "DISTRIBUTE" }] } },
+    rewardDefs: [{ rewardId: "referral", type: "DIRECT", rate: "10", target: "PARENT" }],
+    rankDefs: [
+      { rankId: "V0", levelIndex: 0, rankRate: "0" },
+      { rankId: "V1", levelIndex: 1, rankRate: "10",
+        conditions: [{ type: "COMPARE", field: "directCount", operator: "GTE", value: 3 }] },
+    ],
+  },
+});
+// result.final = [{ nodeId: "user0", amount: "100", ... }]  // 命中 V1 → rankRate 10%
+```
+
+> ⚠️ **RANK 默认不覆盖宿主已预计算的 rankRate**（`node.rankRate !== undefined` 即视为宿主口径优先，
+> 需覆盖请在 stage 上声明 `config: { overwrite: true }`）。因此**不要给节点兜底写 `rankRate: "0"`** ——
+> 那会被当成「宿主已算好且为最低等级」而跳过评级，结果是静默零发放。没有预计算值时就别设这个字段。
+> ⚠️ 两条来路都缺失时，`skipRankZero`（默认 `true`）会跳过发放并返回 `[]`。这是 fail-safe
+> 方向（宁可少发不可超发）的有意设计，不是 bug；接入自测时先确认 `final` 非空再上量。
 
 > ⚠️ 比例语义：`rate`/`ratio`/`rankRate` 均为**百分比整数**（`"10"` = 10%），不是小数。
 > ⚠️ 流水线阶段：`pipelineDef.stages` 元素必须使用 `handler` 字段（如 `{ handler: "DISTRIBUTE" }`）。

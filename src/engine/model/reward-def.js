@@ -15,7 +15,7 @@
  *   时从事件动态取数（"eventValue" 取事件值本身；"event.attrs.<path>" 按点分
  *   路径取事件扩展属性），取数失败回退 amount。target 语义同 DIRECT/FIXED。
  *
- * 对应《03_通用营销激励引擎架构设计.md》§4.3 RewardDef 的最小实现。
+ * 「怎么分」的最小声明式表达：一条 RewardDef 即一条可配置的奖励规则。
  *
  * @version 1.2.0
  */

@@ -54,9 +54,22 @@ const REQUIRED_CONFIG_KEYS = ["name", "ruleSetCode", "model", "buildEvent", "bui
  * @param {Function} config.idempotency.buildPreReadWhere - (event) => where object
  * @param {Function} config.idempotency.buildFallbackWhere - (event) => where object
  * @param {Function} [config.postProcess] - (businessEvent, createdRecords, transaction) => Promise<void>
+ * @param {Function} [config.loadCapState] - (options?) => Promise<capState|null>
+ *   平台/单用户日封顶水位加载钩子（可选）。
+ *   结算前读取当前已发放水位，供 CAP 阶段跨事件累计封顶。
+ *   返回 null/undefined 时引擎自建初始水位（与不配置时行为一致，封顶仅限单事件内）。
+ *   配置后与 saveCapState 成对使用，才能实现「跨事件平台日封顶」（P0-1 资金安全修复）。
+ * @param {Function} [config.saveCapState] - (capState, transaction) => Promise<void>
+ *   平台/单用户日封顶水位持久化钩子（可选）。
+ *   在结算事务内、落账之后调用；与记录共享同一事务，任一步失败即整体回滚，
+ *   保证「水位推进」与「收益落账」原子一致，不留半截状态。
  * @param {Object} config.sequelize - Sequelize 实例（必需）
  * @param {Object} config.ruleSetService - 规则集服务（必需，需有 getActiveRuleSet 方法）
  * @param {Object} [config.logger] - 日志对象（可选，缺省使用 console）
+ * @param {boolean} [config.useBulkCreate=false] - 是否用 model.bulkCreate 批量插入收益记录（可选）。
+ *   缺省 false（逐条 model.create，与历史行为一致）。多条记录场景置 true 可把 N 次
+ *   DB round-trip 压成 1 次；代价是返回实例的主键回填依赖数据库方言，
+ *   若你的 postProcess / 调用方依赖 data.lines 里的自增主键，请先验证后再开启。
  */
 class GenericSettlementService {
   constructor(config) {
@@ -74,6 +87,17 @@ class GenericSettlementService {
     this.buildRecord = config.buildRecord;
     this.idempotency = config.idempotency;
     this.postProcess = config.postProcess || null;
+    // 封顶水位钩子（可选，成对使用）：loadCapState 结算前读水位，saveCapState 事务内持久化。
+    // 未配置时维持历史行为（每次结算水位从零开始，封顶仅单事件内生效）。
+    this.loadCapState = config.loadCapState || null;
+    this.saveCapState = config.saveCapState || null;
+    // 批量插入开关（P2 性能）：默认 false = 逐条 model.create（保持历史行为不变）。
+    // 一次事件产出 N 条收益记录时，逐条 create 就是 N 次 round-trip；深层级链路
+    // （10~20 层）下这是结算耗时的主要来源。置 true 改用 model.bulkCreate 一次插入。
+    // 之所以不默认开启：bulkCreate 返回实例的主键回填依赖方言
+    // （部分方言/配置下 id 不回填），而返回值会经 data.lines 与 postProcess 暴露给宿主 ——
+    // 静默改变既有接入方拿到的实例内容属于破坏性变更，必须由宿主确认后显式开启。
+    this.useBulkCreate = config.useBulkCreate === true;
 
     // 引擎依赖注入
     if (!config.sequelize) throw new Error("GenericSettlement 配置缺少必填项: sequelize");
@@ -171,8 +195,8 @@ class GenericSettlementService {
     // 4. 开启事务 + 落账
     const t = await this.sequelize.transaction();
     try {
-      // 5. 落账阶段（事务内）
-      const writeResult = await this._writeRecords(businessEvent, calcResult.dbRecords, t);
+      // 5. 落账阶段（事务内）：写收益记录 + 持久化封顶水位（原子提交）。
+      const writeResult = await this._writeRecords(businessEvent, calcResult.dbRecords, t, calcResult.capState);
       await t.commit();
       return { success: true, data: writeResult, idempotent: false };
     } catch (err) {
@@ -219,7 +243,7 @@ class GenericSettlementService {
       return { success: true, data: { skipped: true, lines: [] }, idempotent: false };
     }
 
-    const writeResult = await this._writeRecords(businessEvent, calcResult.dbRecords, transaction);
+    const writeResult = await this._writeRecords(businessEvent, calcResult.dbRecords, transaction, calcResult.capState);
     return { success: true, data: writeResult, idempotent: false };
   }
 
@@ -229,6 +253,10 @@ class GenericSettlementService {
    * 每个事件独立 _calculate，但共享同一事务落账。
    * 任一事件失败则全部回滚。
    * 注意：批量场景下游事件可能依赖上游落账结果，需在配置 postProcess 中处理。
+   *
+   * 错误契约：所有失败路径（入参非数组 / 事件校验失败 / 计算失败 / 落账异常）
+   * 一律返回 `{ success: false, message }`，**不抛异常** —— 调用方只需检查 `success`。
+   * 失败时事务已回滚，本批次零落账，不存在部分成功。
    *
    * @param {Array<Object>} events - 业务事件列表
    * @param {Object} [options] - 可选参数（同 settle）
@@ -276,14 +304,26 @@ class GenericSettlementService {
     const t = await this.sequelize.transaction();
     try {
       const newResults = [];
+      // 批量内共享封顶水位：同一事务内上游事件推进的 capState 传给下游事件，
+      // 使「平台日封顶」在批量内连续生效（P0-1 资金安全修复）。
+      // 初始水位：优先取 loadCapState 钩子读取的历史累计（跨批次），
+      // 未配置钩子时从零开始（与单事件行为一致）。
+      let batchCapState = null;
+      if (this.loadCapState) {
+        batchCapState = await this.loadCapState(options);
+      }
       for (const { event } of pendingEvents) {
-        const calcResult = await this._calculate(event, options);
+        const calcResult = await this._calculate(event, { ...options, capState: batchCapState });
         if (!calcResult.ok) {
           await t.rollback();
           return { success: false, message: `事件 ${event.orderNo || event.tradeNo || "?"} 计算失败: ${calcResult.message}` };
         }
-        const writeResult = await this._writeRecords(event, calcResult.dbRecords, t);
+        const writeResult = await this._writeRecords(event, calcResult.dbRecords, t, calcResult.capState);
         newResults.push({ lines: writeResult.lines, idempotent: false });
+        // 推进批量水位，供下一个事件使用
+        if (calcResult.capState) {
+          batchCapState = calcResult.capState;
+        }
       }
       await t.commit();
 
@@ -302,7 +342,21 @@ class GenericSettlementService {
       return { success: true, data: { results: allResults } };
     } catch (err) {
       await t.rollback();
-      throw err;
+      // P2 一致性修复：与 batchSettle 的其他所有失败出口（非数组 / 校验失败 / 计算失败）
+      // 以及 settle 的错误契约对齐 —— 统一返回 { success: false, message }，不再往外抛。
+      // 原实现在 DB 层异常时 throw，导致同一个方法既可能返回 success:false 又可能抛异常，
+      // 调用方只检查 result.success 就会漏掉整批未落账的情况（批量结算漏账无人知）。
+      // 事务已回滚，本批次零落账，语义上就是「整批失败」。
+      // 不复用 _handleSettleError：它的 UniqueConstraintError 兜底会按【单个事件】的
+      // fallbackWhere 回读并宣告幂等成功，用在批量上会把整批失败误报成部分成功。
+      this.log.error(
+        `[GenericSettlement:${this.name}] 批量结算失败（事务已回滚，本批 ${pendingEvents.length} 个待处理事件均未落账）: ${err.message}`,
+        err
+      );
+      return {
+        success: false,
+        message: `批量结算失败（事务已回滚，无部分落账）: ${err.message}`,
+      };
     }
   }
 
@@ -311,20 +365,27 @@ class GenericSettlementService {
    *
    * @param {Object} businessEvent - 业务事件
    * @param {Object} options - { ruleSetCode?, routingKey? }
-   * @returns {Promise<Object>} { ok, dbRecords?, message? }
+   * @returns {Promise<Object>} { ok, dbRecords?, capState?, message? }
+   *   capState：引擎执行后推进的封顶水位（未配置 loadCapState 或流水线无 CAP 阶段时为 null）。
+   *   调用方需在事务内通过 saveCapState 持久化，与收益记录原子提交。
    */
   async _calculate(businessEvent, options = {}) {
     const ruleSetCode = options.ruleSetCode || this.ruleSetCode;
 
-    // 预防性告警（防止"把 ruleSetCode 放事件内却漏传 options"静默用错默认规则集）：
-    // - options.ruleSetCode 缺省时本次用配置默认规则集；
-    // - 若事件内也带 ruleSetCode，几乎可断定调用方意图覆盖但传错了地方，务必明示。
-    if (!options.ruleSetCode) {
+    // 预防性告警（防止"把 ruleSetCode 放事件内却漏传 options"静默用错默认规则集）。
+    //
+    // P2 修复：只在【真有误用信号】时告警，不再每单都打。
+    // 原实现只要 options.ruleSetCode 缺省就 warn —— 但"依赖构造时默认规则集"是文档
+    // 明示的正常用法，等于给每一笔结算都打一条 warn（百万单量级刷爆日志、淹没真实告警，
+    // 且运维会训练出忽略该级别日志的习惯）。
+    // 真正的误用信号是：事件内带了 ruleSetCode 且与本次生效的规则集不同 ——
+    // 此时几乎可断定调用方意图覆盖却传错了位置，必须明示。
+    const eventRuleSetCode = businessEvent && businessEvent.ruleSetCode;
+    if (!options.ruleSetCode && eventRuleSetCode && eventRuleSetCode !== ruleSetCode) {
       this.log.warn(
-        `[GenericSettlement:${this.name}] 未传 options.ruleSetCode，本次计算使用默认规则集 "${this.ruleSetCode}"` +
-          (businessEvent && businessEvent.ruleSetCode
-            ? `；注意：事件内 ruleSetCode="${businessEvent.ruleSetCode}" 仅用于 buildRecord 落库 rule_set_code 字段，不参与引擎选择规则集`
-            : "")
+        `[GenericSettlement:${this.name}] 事件内 ruleSetCode="${eventRuleSetCode}" 与本次计算使用的规则集 "${ruleSetCode}" 不一致：` +
+          `事件内字段仅用于 buildRecord 落库 rule_set_code 审计列，不参与引擎选择规则集。` +
+          `如需覆盖规则集，请显式传 options.ruleSetCode。`
       );
     }
 
@@ -377,8 +438,22 @@ class GenericSettlementService {
     });
 
     // 5. 引擎执行
-    const result = engine.Orchestrate.executePipeline({ stages });
+    //    封顶水位（capState）跨事件累计：若配置了 loadCapState 钩子，结算前读取
+    //    当前已发放水位并注入 context，使 CAP 阶段能基于「历史累计」而非「单事件内」
+    //    裁剪 —— 这是平台日封顶生效的前提（P0-1 资金安全修复）。
+    //    未配置钩子时维持历史行为：context 无 capState，引擎自建初始水位（封顶仅单事件内）。
+    //    批量场景（batchSettle）通过 options.capState 传入本批次已累计的水位，
+    //    使同一事务内上游事件推进的水位对下游事件立即可见（优先于 loadCapState）。
+    let capState = options.capState || null;
+    if (!capState && this.loadCapState) {
+      capState = await this.loadCapState(options);
+    }
+    const context = capState ? { capState } : {};
+    const result = engine.Orchestrate.executePipeline({ stages, context });
     const engineRecords = result.final || [];
+    // 引擎执行后 context.capState 已被 CAP 阶段推进（applyCaps 就地写水位），
+    // 返回给调用方，供 _writeRecords 在事务内持久化。
+    const updatedCapState = result.context?.capState || null;
 
     // 6. 引擎输出 → 数据库记录（过滤 buildRecord 返回 null 的记录）
     const dbRecords = [];
@@ -389,7 +464,7 @@ class GenericSettlementService {
       }
     }
 
-    return { ok: true, dbRecords };
+    return { ok: true, dbRecords, capState: updatedCapState };
   }
 
   /**
@@ -399,13 +474,30 @@ class GenericSettlementService {
    * @param {Object} businessEvent - 业务事件
    * @param {Array<Object>} dbRecords - 待落账记录
    * @param {import("sequelize").Transaction} transaction - 事务
+   * @param {Object|null} [capState] - 本次推进后的封顶水位（来自 _calculate 返回值）
    * @returns {Promise<Object>} { lines: Array } 已落账记录列表
    */
-  async _writeRecords(businessEvent, dbRecords, transaction) {
-    const createdRecords = [];
-    for (const record of dbRecords) {
-      const created = await this.model.create(record, { transaction });
-      createdRecords.push(created);
+  async _writeRecords(businessEvent, dbRecords, transaction, capState = null) {
+    // P2 性能：useBulkCreate=true 时一次插入（N 次 round-trip → 1 次）；
+    // 缺省仍逐条 create，保持既有接入方拿到的实例语义完全不变。
+    // 两条路径都在同一事务内，失败即整体回滚。
+    let createdRecords;
+    if (this.useBulkCreate && typeof this.model.bulkCreate === "function" && dbRecords.length > 0) {
+      createdRecords = await this.model.bulkCreate(dbRecords, { transaction });
+    } else {
+      createdRecords = [];
+      for (const record of dbRecords) {
+        const created = await this.model.create(record, { transaction });
+        createdRecords.push(created);
+      }
+    }
+
+    // 封顶水位持久化（事务内，落账后）：若配置了 saveCapState 钩子，把本次推进后的
+    // capState 与收益记录在同一事务内提交 —— 水位写失败即整体回滚，绝不允许
+    // 「记录已落账但水位未保存」（否则后续事件会基于旧水位重复发放，超发）。
+    // 注意：capState 需由调用方负责序列化/存储格式；Map 序列化等由钩子实现决定。
+    if (this.saveCapState && capState) {
+      await this.saveCapState(capState, transaction);
     }
 
     // postProcess 钩子（事务内，落账后）：客户扩展点，必须保持幂等

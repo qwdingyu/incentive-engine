@@ -77,24 +77,40 @@ function evaluateTier(node, tier) {
     return evaluateCondition(wrapper, node);
   }
 
-  // ===== 遗留字段模式（兼容层，松茸 vip_tiers 旧映射） =====
+  // ===== 遗留字段模式（兼容层：宿主等级表的 min_* 字段直接映射，未翻译为 conditions） =====
   // 有效直推数检查
   const minDirectCount = _getMinDirectCount(tier);
+  // 团队业绩检查
+  const minTeamPerformance = _getMinTeamPerformance(tier);
+  // 高级别下属数检查（支持 per-tier 差异化）
+  const minHigherTierCount = _getMinHigherTierCount(tier);
+  const requiredHigherTier = _getRequiredHigherTier(tier);
+
+  // 资金安全（P0-2 fail-closed）：levelIndex > 0 的等级若既无 conditions、
+  // 也无任何遗留门槛来源（min_* 全为 0 且无有效的 requiredHigherTier），说明该等级
+  // 没有任何晋升条件 —— 此时必须判定为「不满足」，而不是「全部门槛取 0 逐项
+  // 跳过 → return true」。否则配置漏写 conditions 会让所有节点直接命中最高等级、
+  // 顶格分成比例（超发）。安全默认是 fail-closed：无条件来源即不晋升。
+  // 注意：requiredHigherTier === null（DB 显式 NULL）时高级别下属检查会被跳过，
+  // 因此 null 不构成有效门槛，只有 undefined（单值模式）或具体等级号（per-tier）才算。
+  const hasAnyLegacyGate =
+    minDirectCount > 0 ||
+    minTeamPerformance > 0 ||
+    (minHigherTierCount > 0 && requiredHigherTier !== null);
+  if (!hasAnyLegacyGate) {
+    return false;
+  }
+
   if (minDirectCount > 0) {
     if ((node.directCount || 0) < minDirectCount) return false;
   }
 
-  // 团队业绩检查
-  const minTeamPerformance = _getMinTeamPerformance(tier);
   if (minTeamPerformance > 0) {
     if (!Decimal.gte(node.teamPerformance || "0", String(minTeamPerformance))) return false;
   }
 
-  // 高级别下属数检查（支持 per-tier 差异化）
-  const minHigherTierCount = _getMinHigherTierCount(tier);
   if (minHigherTierCount > 0) {
-    const requiredHigherTier = _getRequiredHigherTier(tier);
-    // 对齐抽取前行为：required_higher_tier 显式为 null（DB 明确 NULL）时，
+    // required_higher_tier 显式为 null（DB 明确 NULL）时，
     // 原实现跳过高级别下属检查（视为满足），不能降级到单值模式误判失败。
     if (requiredHigherTier !== null) {
       // 优先使用 node.higherTierCounts[requiredHigherTier]（per-tier 模式），

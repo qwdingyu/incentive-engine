@@ -6,7 +6,7 @@
   "scripts": {
     "test": "node --experimental-vm-modules node_modules/.bin/jest",
     "test:watch": "node --experimental-vm-modules node_modules/.bin/jest --watch",
-    "smoke": "node scripts/smoke-require.js",
+    "smoke": "node scripts/smoke-require.js && node scripts/smoke-business.js",
     "prepublishOnly": "node scripts/verify-pack.js"
   },
   "keywords": [
@@ -37,8 +37,8 @@
   },
   "files": [
     "src/",
-    "docs/",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "devDependencies": {
     "jest": "^29.7.0",
