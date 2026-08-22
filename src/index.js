@@ -34,7 +34,12 @@
  * - engine.Utils          — 工具函数（分页/灰度路由/日期函数）
  * - engine.Decimal        — 安全金额计算（decimal.js 包装）
  *
- * @version 4.0.0
+ * 打包型消费方（Cloudflare Workers / esbuild 单文件 ESM）请改用 `./pure` 子入口：
+ * `require("@usethink/incentive-engine/pure")` —— 只含 Distribute / Evaluate / Allocate /
+ * Orchestrate / Model / Reverse / Decimal 这 7 个纯计算子模块，
+ * 导入图零 Node 内建依赖，形状与本入口完全一致。原因见 src/pure.js 头部说明。
+ *
+ * @version 4.1.0
  * @license MIT
  */
 

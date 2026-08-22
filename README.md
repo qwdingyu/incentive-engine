@@ -18,6 +18,30 @@ npm install @usethink/incentive-engine
 包内自带 TypeScript 类型声明（`src/index.d.ts`，由 `package.json` 的 `types` 指向），
 TS 项目无需额外安装 `@types/*`。
 
+### 两个入口：包根 vs `./pure`（v4.1.0）
+
+| 入口 | 导出 | 导入图外部依赖 | 适用 |
+|------|------|---------------|------|
+| `@usethink/incentive-engine`（包根） | 全部 11 个子模块 | `decimal.js` + 惰性 `crypto`/`sequelize`/`joi` | 长驻 Node 服务（绝大多数场景） |
+| `@usethink/incentive-engine/pure` | `Distribute` `Evaluate` `Allocate` `Orchestrate` `Model` `Reverse` `Decimal` | 仅 `decimal.js`，**零 Node 内建** | 打包型消费方：Cloudflare Workers、esbuild 单文件 ESM |
+
+```javascript
+// 打包成单文件 ESM / 跑在 Cloudflare Workers 上，用这个：
+const engine = require("@usethink/incentive-engine/pure");
+// 或 ESM/TS：import engine from "@usethink/incentive-engine/pure";
+```
+
+`./pure` 与包根**同名、同嵌套**：从包根切过去只改 import 路径，
+`engine.Distribute.distributeByDefs(...)` 一行都不用动。
+它不含 `Utils`（用 `crypto`）/ `Services`（用 `sequelize`）/ `Validation`（用 `joi`）/ `Adapters`
+—— 需要这些请用包根。为什么必须是独立入口而不是「把 require 改惰性」：
+打包器会静态解析函数体内的 require，惰性化只能消除运行期崩溃，
+消不掉 `--platform=browser` 的打包期 `Could not resolve "crypto"`。
+
+> `exports` 映射自 4.1.0 起只公开 `"."` / `"./pure"` / `"./package.json"`，
+> 深导入（`.../src/xxx.js`）会抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`。这是有意为之，
+> 原因见 [`CHANGELOG.md`](CHANGELOG.md) 的 4.1.0 条目。
+
 > ⚠️ **4.0.0 是资金安全导向的破坏性升级**：若干「配置写错却静默按最宽松口径放行」的路径
 > 改为显式抛错或按最严口径处理。升级前请读 [`CHANGELOG.md`](CHANGELOG.md)，
 > 并在预发环境用真实规则集与真实订单核对发放总额。
@@ -843,15 +867,16 @@ const result = executeCustomerIncentive({
 npm install      # 安装依赖
 npm test         # 运行测试（覆盖全部模块）
 npm run test:watch  # 观察模式
-npm run smoke    # 顶层加载冒烟：模拟消费方 require 入口，防护可选 peer 误提升
+npm run smoke    # 入口冒烟：顶层加载 + 业务场景 + ./pure 零内建依赖守卫
 
 cd demo && npm install && npm run demo:all   # 运行 4 个行业集成 Demo
 ```
 
 ### 发版防线
 
-- `prepublishOnly` 在 `npm publish` 前执行 `scripts/verify-pack.js`，用 `npm pack --dry-run --json` 断言 tarball 必备文件（LICENSE / README / src 入口）齐全，发版零阻塞。
+- `prepublishOnly` 在 `npm publish` 前执行 `scripts/verify-pack.js` + `scripts/smoke-pure.js`：前者用 `npm pack --dry-run --json` 断言 tarball 必备文件（LICENSE / README / `src/index.*` / `src/pure.*`）齐全，后者断言 `./pure` 的导入图仍是零 Node 内建、且形状与包根一致。发版零阻塞。
 - `joi` / `sequelize` 为 **optional peerDependencies**：消费方缺装也能安全顶层加载（真正使用结算/校验功能时才需要）。改动引擎入口时请运行 `npm run smoke` 守护，勿把 optional peer 提升到顶层 `require`。
+- **`./pure` 的两条硬约束**：导入图零 Node 内建 + 与包根同名同嵌套。改动 `src/engine/**`、`src/decimal.js` 或 `src/pure.js` 后必须跑 `npm run smoke`（`scripts/smoke-pure.js` 会静态遍历导入图并用 esbuild 真实打包复核）与 `tests/pure-entry.test.js`。形状漂移的后果是消费方拿到 `undefined` 并被自身 try/catch 吞掉 —— 静默不发放、零报错。
 
 ---
 

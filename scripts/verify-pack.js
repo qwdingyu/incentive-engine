@@ -7,7 +7,18 @@ const { execFileSync } = require("child_process");
 
 // 必备文件清单（相对 tarball 根）；npm 会自动包含 LICENSE/README/package.json/main，
 // 此处显式断言以兜底未来误改 files 白名单。
-const REQUIRED_FILES = ["LICENSE", "README.md", "CHANGELOG.md", "package.json", "src/index.js", "src/index.d.ts"];
+const REQUIRED_FILES = [
+  "LICENSE",
+  "README.md",
+  "CHANGELOG.md",
+  "package.json",
+  "src/index.js",
+  "src/index.d.ts",
+  // v4.1.0：./pure 子入口。exports 映射已把它列为公开子路径，
+  // 漏带会让消费方 `import ... from "@usethink/incentive-engine/pure"` 直接解析失败。
+  "src/pure.js",
+  "src/pure.d.ts",
+];
 
 // 禁止进入 tarball 的目录前缀：内部审查报告、评估文档、Demo 与测试不应随包分发。
 const FORBIDDEN_PREFIXES = ["docs/", "demo/", "tests/", "scripts/"];

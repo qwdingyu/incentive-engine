@@ -1071,7 +1071,38 @@ export declare namespace Utils {
   function isWithinWindow(window: TimeWindow, occurredAt: Instant, label?: string): boolean;
 }
 
+/* ============================================================================
+ * 默认导出（v4.1.0 新增，纯增量）
+ * ==========================================================================*/
 
+/**
+ * 引擎默认导出 —— 与 CJS `module.exports` 的形状**一一对应**。
+ *
+ * 为什么需要它：
+ * 本文件原先只有具名导出（`export declare namespace X`），没有 `export default`
+ * 也没有 `export =`。打包型消费方以 `import engine from "@usethink/incentive-engine"`
+ * 方式引入时（`esModuleInterop` + `moduleResolution: bundler`）拿不到类型，
+ * 只能各自手写 `declare module` 兜底 —— 手写声明与真实导出一旦漂移，
+ * TS 不会报错，错误会一直潜伏到运行时（曾造成消费方奖励静默不发放）。
+ *
+ * ⚠️ 不能用 `export =`：`export =` 无法与本文件已有的具名导出共存，
+ * 改成 `export =` 会破坏所有 `import { Distribute } from ...` 的存量用法。
+ *
+ * ⚠️ 维护约束：本对象的键必须与 `src/index.js` 的 `module.exports` 完全一致。
+ * 新增/删除顶层子模块时，必须同步改这里（`npm test` 有形状契约测试兜底）。
+ */
+declare const engine: {
+  Model: typeof Model;
+  Distribute: typeof Distribute;
+  Evaluate: typeof Evaluate;
+  Allocate: typeof Allocate;
+  Orchestrate: typeof Orchestrate;
+  Reverse: typeof Reverse;
+  Adapters: typeof Adapters;
+  Decimal: typeof Decimal;
+  Services: typeof Services;
+  Validation: typeof Validation;
+  Utils: typeof Utils;
+};
 
-
-
+export default engine;

@@ -7,6 +7,68 @@
 
 ---
 
+## [4.1.0] — 2026-08-22
+
+本版本**不改任何计算结果**，全部变更服务于一个目标：让引擎能被**打包型消费方**
+（Cloudflare Workers、esbuild 单文件 ESM）安全使用。计算内核、金额语义、API 形状零改动。
+
+### 背景（真实事故）
+
+包根会 `require("./utils")`，而 `src/utils/version-select.js` 在**模块顶层**
+`require("crypto")`。长驻 Node 环境（如 rbb）完全正常，但消费方用 esbuild 打成
+单文件 ESM 后，打包器无法静态分析该 require，会替换成动态 require 辅助函数，
+进程一加载模块就抛 `Dynamic require of "crypto" is not supported` —— 曾导致
+某消费方服务启动即崩。`--platform=browser`（Cloudflare Workers）下更早，
+直接在打包期报 `Could not resolve "crypto"`。
+
+### 新增
+
+- **`@usethink/incentive-engine/pure` 子入口** —— 零 Node 内建依赖的纯计算入口。
+  导出 7 个子模块：`Distribute` / `Evaluate` / `Allocate` / `Orchestrate` /
+  `Model` / `Reverse` / `Decimal`（唯一外部依赖是 `decimal.js`，可被打包器打进产物）。
+  **与包根同名、同嵌套**：消费方从包根切到 `/pure` 只需改 import 路径，
+  `engine.Distribute.distributeByDefs(...)` 一行都不用动。
+  不含 `Utils`（用 crypto）/ `Services`（用 sequelize）/ `Validation`（用 joi）/ `Adapters`
+  —— 需要这些请继续用包根。
+- **`src/pure.d.ts`** —— `/pure` 的官方类型声明，只声明运行时真实存在的 7 个子模块。
+  访问 `engine.Utils` 会在**类型检查期**就报错，而不是运行期拿到 `undefined`。
+- **`src/index.d.ts` 新增默认导出声明**（纯增量，具名导出全部保留）。
+  此前本文件只有具名导出，`import engine from "@usethink/incentive-engine"` 拿不到类型，
+  消费方只能各自手写 `declare module` 兜底 —— 手写声明与真实导出漂移时 TS 不报错，
+  错误会潜伏到运行期。现在可以直接用随包类型。
+- **`scripts/smoke-pure.js`** —— `/pure` 的守卫脚本，已接入 `npm run smoke` 与
+  `prepublishOnly`。断言：导入图 0 个 node 内建（静态遍历，能抓到函数体内的惰性 require）、
+  裸包依赖均已在 `dependencies` 声明、与包根形状一致、真实计算结果正确；
+  本机能解析到 esbuild 时额外用 `--format=esm --platform=browser` 真实打包复核。
+- **`tests/pure-entry.test.js`** —— `/pure` 的形状/最小面契约测试，含灰度分桶回归基线。
+
+### 变更
+
+- **`src/utils/version-select.js`：`require("crypto")` 从模块顶层挪进函数体（惰性）。**
+  修掉了上述「模块一加载就崩」的问题。分桶算法未改，A/B 分配结果与 4.0.0 逐键一致
+  （已用 2000+ 个 routingKey 对比验证，并在 `tests/pure-entry.test.js` 钉死回归基线）。
+  ⚠️ 惰性化**只解决运行期崩溃，不解决 `--platform=browser` 的打包期报错** ——
+  打包器同样会静态解析函数体内的 require。Cloudflare Workers 场景必须用 `/pure`。
+- **新增 `exports` 映射**，公开子路径为 `"."` / `"./pure"` / `"./package.json"`。
+  `main` / `types` 保留，旧解析器（`moduleResolution: node`）行为不变。
+
+### ⚠️ 需要留意（严格 semver 视角）
+
+`exports` 映射会**封印所有未列出的子路径**。此前 `require("@usethink/incentive-engine/src/xxx.js")`
+这类深导入是可行的，本版本起会抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`。
+
+这是**有意为之**：深导入曾造成严重事故 —— 消费方为绕开 crypto 而深导入
+`src/engine/distribute/index.js`，该文件把 `Distribute` 这一层抹平了，于是
+`engine.Distribute` 为 `undefined`，调用抛 `TypeError` 被消费方 try/catch 吞掉，
+表现为「奖励全部静默不发放且零报错」。封印深导入 = 让这类错误在解析期就暴露。
+
+已确认本组织内**无任何代码依赖深导入**（唯一的子路径用法是
+`require("@usethink/incentive-engine/package.json")`，已显式保留）。
+若你的项目存在深导入，请改用包根或 `/pure`。按严格 semver 这属于 breaking change，
+如需保守发布可将本次改为 `5.0.0`。
+
+---
+
 ## [4.0.0] — 2026-08-20
 
 本版本是一次**资金安全导向的破坏性升级**。全部破坏性变更的方向都是
